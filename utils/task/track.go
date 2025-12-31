@@ -29,6 +29,7 @@ type Track struct {
 	DiscTotal    int
 	AlbumData    ampapi.AlbumRespData
 	PlaylistData ampapi.PlaylistRespData
+	Lrc          string // Lyrics content
 }
 
 func (t *Track) GetAlbumData(token string) error {

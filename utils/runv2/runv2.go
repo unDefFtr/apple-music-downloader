@@ -13,16 +13,81 @@ import (
 	"os"
 	"time"
 
-	"github.com/itouakirai/mp4ff/mp4"
 	"github.com/grafov/m3u8"
+	"github.com/itouakirai/mp4ff/mp4"
 
 	"encoding/binary"
+
 	"github.com/schollz/progressbar/v3"
 
 	"main/utils/structs"
 )
+
 const prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
+
 var ErrTimeout = errors.New("response timed out")
+
+// DecryptionContext holds the information needed to decrypt a downloaded file
+type DecryptionContext struct {
+	AdamId           string
+	PlaylistSegments []*m3u8.MediaSegment
+	TotalLen         int64
+	Config           structs.ConfigSet
+}
+
+type ProgressWriter struct {
+	Total      int64
+	Current    int64
+	Callback   structs.ProgressCallback
+	Msg        string
+	StartTime  time.Time
+	LastUpdate time.Time
+}
+
+func (pw *ProgressWriter) Update(n int) {
+	pw.Current += int64(n)
+
+	if pw.StartTime.IsZero() {
+		pw.StartTime = time.Now()
+		pw.LastUpdate = time.Now()
+	}
+
+	if pw.Total > 0 && pw.Callback != nil {
+		percent := float64(pw.Current) / float64(pw.Total)
+
+		var bps float64
+		// Calculate speed
+		duration := time.Since(pw.StartTime).Seconds()
+		var speed string
+		if duration > 0 {
+			bps = float64(pw.Current) / duration
+			speed = formatSpeed(bps)
+		} else {
+			speed = "0 B/s"
+		}
+
+		// Limit updates to avoid overwhelming the TUI (e.g. every 100ms) or when finished
+		if time.Since(pw.LastUpdate) > 100*time.Millisecond || percent >= 1.0 {
+			pw.Callback(percent, fmt.Sprintf("%s (%s)", pw.Msg, speed), bps)
+			pw.LastUpdate = time.Now()
+		}
+	}
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	pw.Update(n)
+	return n, nil
+}
+
+func formatSpeed(bps float64) string {
+	if bps >= 1024*1024 {
+		return fmt.Sprintf("%.2f MB/s", bps/(1024*1024))
+	} else if bps >= 1024 {
+		return fmt.Sprintf("%.2f KB/s", bps/1024)
+	}
+	return fmt.Sprintf("%.0f B/s", bps)
+}
 
 type TimedResponseBody struct {
 	timeout   time.Duration
@@ -43,8 +108,24 @@ func (b *TimedResponseBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet, cb structs.ProgressCallback) error {
+	// Fallback to sequential mode if split is not desired, but here we implement the split logic.
+	// Actually, for backward compatibility, we can just call Download then Decrypt.
+	// But splitting them allows the caller to manage concurrency.
+	// For now, let's keep Run as is for existing callers, but implement Download and Decrypt.
+	// Wait, existing callers (main.go) will be updated.
+	// So we can remove the old Run or rewrite it to use the new functions.
 
-func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
+	ctx, err := Download(adamId, playlistUrl, outfile, Config, cb)
+	if err != nil {
+		return err
+	}
+
+	return Decrypt(ctx, outfile, outfile, cb) // Decrypt in place or to same file (Download saves to outfile directly currently)
+}
+
+// Download downloads the encrypted file content to outfile and returns the decryption context.
+func Download(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet, cb structs.ProgressCallback) (*DecryptionContext, error) {
 	var err error
 	var optstimeout uint
 	optstimeout = 0
@@ -54,36 +135,36 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	// request media playlist
 	req, err := http.NewRequest("GET", playlistUrl, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header = header
 	// requesting an HLS playlist should be relatively fast, so we set the timeout directly on the client
 	do, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// parse m3u8
 	segments, err := parseMediaPlaylist(do.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	segment := segments[0]
 	if segment == nil {
-		return errors.New("no segments extracted from playlist")
+		return nil, errors.New("no segments extracted from playlist")
 	}
 	if segment.Limit <= 0 {
-		return errors.New("non-byterange playlists are currently unsupported")
+		return nil, errors.New("non-byterange playlists are currently unsupported")
 	}
 
 	// get URL to the actual file
 	parsedUrl, err := url.Parse(playlistUrl)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	fileUrl, err := parsedUrl.Parse(segment.URI)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// request mp4
@@ -91,7 +172,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	defer cancel(nil)
 	req, err = http.NewRequestWithContext(ctx, "GET", fileUrl.String(), nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header = header
 
@@ -103,7 +184,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		timer := time.AfterFunc(timeout, func() { cancel(ErrTimeout) })
 		do, err = client.Do(req)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer do.Body.Close()
 		body = &TimedResponseBody{
@@ -112,14 +193,18 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 			threshold: 256,
 			body:      do.Body,
 		}
-	} else {
-		do, err = client.Do(req)
+		// Always download to file first in this new flow
+		ofh, err := os.Create(outfile)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		defer do.Body.Close()
-		if do.ContentLength < int64(Config.MaxMemoryLimit * 1024 * 1024) {
-			var buffer bytes.Buffer
+		defer ofh.Close()
+
+		var writer io.Writer
+		if cb != nil {
+			pw := &ProgressWriter{Total: do.ContentLength, Callback: cb, Msg: "Downloading"}
+			writer = io.MultiWriter(ofh, pw)
+		} else {
 			bar := progressbar.NewOptions64(
 				do.ContentLength,
 				progressbar.OptionClearOnFinish(),
@@ -138,36 +223,108 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 					BarEnd:        "",
 				}),
 			)
-			io.Copy(io.MultiWriter(&buffer, bar), do.Body)
-			body = &buffer
+			writer = io.MultiWriter(ofh, bar)
+		}
+
+		if _, err := io.Copy(writer, body); err != nil {
+			return nil, err
+		}
+
+		if cb == nil {
 			fmt.Print("Downloaded\n")
+		}
+	} else {
+		do, err = client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer do.Body.Close()
+
+		// Always download to file first in this new flow
+		ofh, err := os.Create(outfile)
+		if err != nil {
+			return nil, err
+		}
+		defer ofh.Close()
+
+		var writer io.Writer
+		if cb != nil {
+			pw := &ProgressWriter{Total: do.ContentLength, Callback: cb, Msg: "Downloading"}
+			writer = io.MultiWriter(ofh, pw)
 		} else {
-			body = do.Body
+			bar := progressbar.NewOptions64(
+				do.ContentLength,
+				progressbar.OptionClearOnFinish(),
+				progressbar.OptionSetElapsedTime(false),
+				progressbar.OptionSetPredictTime(false),
+				progressbar.OptionShowElapsedTimeOnFinish(),
+				progressbar.OptionShowCount(),
+				progressbar.OptionEnableColorCodes(true),
+				progressbar.OptionShowBytes(true),
+				progressbar.OptionSetDescription("Downloading..."),
+				progressbar.OptionSetTheme(progressbar.Theme{
+					Saucer:        "",
+					SaucerHead:    "",
+					SaucerPadding: "",
+					BarStart:      "",
+					BarEnd:        "",
+				}),
+			)
+			writer = io.MultiWriter(ofh, bar)
+		}
+
+		if _, err := io.Copy(writer, do.Body); err != nil {
+			return nil, err
+		}
+
+		if cb == nil {
+			fmt.Print("Downloaded\n")
 		}
 	}
 
-	var totalLen int64
-	totalLen = do.ContentLength
+	return &DecryptionContext{
+		AdamId:           adamId,
+		PlaylistSegments: segments,
+		TotalLen:         do.ContentLength, // This might be approximate if using TimedResponseBody, but for download it's fine.
+		Config:           Config,
+	}, nil
+}
+
+// Decrypt decrypts the file at tempFile using the context and writes to outFile.
+// If tempFile and outFile are the same, it will read into memory or a temp file?
+// Actually downloadAndDecryptFile reads from `in` and writes to `outfile`.
+// If we pass the same file path, os.Create(outfile) will truncate it!
+// So we must download to a temp file, and decrypt to the final file.
+func Decrypt(dCtx *DecryptionContext, tempFile string, outFile string, cb structs.ProgressCallback) error {
+	// Open the downloaded encrypted file
+	f, err := os.Open(tempFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
 	// connect to decryptor
-	//addr := fmt.Sprintf("127.0.0.1:10020")
-	addr := Config.DecryptM3u8Port
+	addr := dCtx.Config.DecryptM3u8Port
+	if cb != nil {
+		cb(0.0, "Connecting to Decryptor", 0)
+	}
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
-	//fmt.Print("Decrypting...\n")
 	defer Close(conn)
 
-	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config)
-	if err != nil {
-		return err
-	}
-	fmt.Print("Decrypted\n")
-	return nil
+	// Call the internal function
+	// Note: downloadAndDecryptFile expects `in` to be the stream.
+	// It writes to `outfile`.
+	return downloadAndDecryptFile(conn, f, outFile, dCtx.AdamId, dCtx.PlaylistSegments, dCtx.TotalLen, dCtx.Config, cb)
 }
 
 func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
-	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet) error {
+	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet, cb structs.ProgressCallback) error {
+	if cb != nil {
+		cb(0.0, "Decrypting (Init)", 0)
+	}
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -206,24 +363,31 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 
 	// 'segment' in m3u8 == 'fragment' in mp4ff
 	//fmt.Println("Starting decryption...")
-	bar := progressbar.NewOptions64(totalLen,
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetElapsedTime(false),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionShowCount(),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetDescription("Decrypting..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "",
-			SaucerHead:    "",
-			SaucerPadding: "",
-			BarStart:      "",
-			BarEnd:        "",
-		}),
-	)
-	bar.Add64(int64(offset))
+	var bar *progressbar.ProgressBar
+	var pw *ProgressWriter
+
+	if cb != nil {
+		pw = &ProgressWriter{Total: totalLen, Current: int64(offset), Callback: cb, Msg: "Decrypting"}
+	} else {
+		bar = progressbar.NewOptions64(totalLen,
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionSetElapsedTime(false),
+			progressbar.OptionSetPredictTime(false),
+			progressbar.OptionShowElapsedTimeOnFinish(),
+			progressbar.OptionShowCount(),
+			progressbar.OptionEnableColorCodes(true),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetDescription("Decrypting..."),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "",
+				SaucerHead:    "",
+				SaucerPadding: "",
+				BarStart:      "",
+				BarEnd:        "",
+			}),
+		)
+		bar.Add64(int64(offset))
+	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	for i := 0; ; i++ {
 		var frag *mp4.Fragment
@@ -267,7 +431,11 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 		if err != nil {
 			return err
 		}
-		bar.Add64(int64(rawoffset))
+		if cb != nil {
+			pw.Update(int(rawoffset))
+		} else {
+			bar.Add64(int64(rawoffset))
+		}
 	}
 	err = outBuf.Flush()
 	if err != nil {
@@ -363,7 +531,7 @@ func parseMediaPlaylist(r io.ReadCloser) ([]*m3u8.MediaSegment, error) {
 	return mediaPlaylist.Segments, nil
 }
 
-//pasing
+// pasing
 func ReadInitSegment(r io.Reader) (*mp4.InitSegment, uint64, error) {
 	var offset uint64 = 0
 	init := mp4.NewMP4Init()
@@ -454,7 +622,8 @@ func TransformInit(init *mp4.InitSegment) (map[uint32]mp4.DecryptTrackInfo, erro
 	}
 	return tracks, nil
 }
-//remote
+
+// remote
 // Reset the loops on the script's end and close the connection
 func Close(conn io.WriteCloser) error {
 	defer conn.Close()
@@ -476,8 +645,6 @@ func SendString(conn io.Writer, uri string) error {
 	_, err = io.WriteString(conn, uri)
 	return err
 }
-
-
 
 func cbcsFullSubsampleDecrypt(data []byte, conn *bufio.ReadWriter) error {
 	// Drops 4 last bits -> multiple of 16

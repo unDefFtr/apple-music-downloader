@@ -9,8 +9,11 @@ import (
 	"github.com/go-resty/resty/v2"
 	"google.golang.org/protobuf/proto"
 
+	"main/utils/logger"
+	"main/utils/runv2"
 	cdm "main/utils/runv3/cdm"
 	key "main/utils/runv3/key"
+	"main/utils/structs"
 	"os"
 
 	"bytes"
@@ -225,35 +228,40 @@ func extractKidBase64(b string, mvmode bool) (string, string, string, error) {
 	}
 	return kidbase64, urlBuilder.String(), uriPrefix, nil
 }
-func extsong(b string) bytes.Buffer {
+func extsong(b string, cb structs.ProgressCallback) bytes.Buffer {
 	resp, err := http.Get(b)
 	if err != nil {
 		fmt.Printf("下载文件失败: %v\n", err)
 	}
 	defer resp.Body.Close()
 	var buffer bytes.Buffer
-	bar := progressbar.NewOptions64(
-		resp.ContentLength,
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetElapsedTime(false),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionShowCount(),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetDescription("Downloading..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "",
-			SaucerHead:    "",
-			SaucerPadding: "",
-			BarStart:      "",
-			BarEnd:        "",
-		}),
-	)
-	io.Copy(io.MultiWriter(&buffer, bar), resp.Body)
+	if cb != nil {
+		pw := &runv2.ProgressWriter{Total: resp.ContentLength, Callback: cb, Msg: "Downloading"}
+		io.Copy(io.MultiWriter(&buffer, pw), resp.Body)
+	} else {
+		bar := progressbar.NewOptions64(
+			resp.ContentLength,
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionSetElapsedTime(false),
+			progressbar.OptionSetPredictTime(false),
+			progressbar.OptionShowElapsedTimeOnFinish(),
+			progressbar.OptionShowCount(),
+			progressbar.OptionEnableColorCodes(true),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetDescription("Downloading..."),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "",
+				SaucerHead:    "",
+				SaucerPadding: "",
+				BarStart:      "",
+				BarEnd:        "",
+			}),
+		)
+		io.Copy(io.MultiWriter(&buffer, bar), resp.Body)
+	}
 	return buffer
 }
-func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string) (string, error) {
+func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string, cb structs.ProgressCallback) (string, error) {
 	var keystr string //for mv key
 	var fileurl string
 	var kidBase64 string
@@ -277,7 +285,7 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 	pssh, err := getPSSH("", kidBase64)
 	//fmt.Println(pssh)
 	if err != nil {
-		fmt.Println(err)
+		logger.Error(err)
 		return "", err
 	}
 	headers := map[string]string{
@@ -296,13 +304,13 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 	if serverUrl != "" {
 		keystr, keybt, err = key.GetKey(ctx, serverUrl, pssh, nil)
 		if err != nil {
-			fmt.Println(err)
+			logger.Error(err)
 			return "", err
 		}
 	} else {
 		keystr, keybt, err = key.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
 		if err != nil {
-			fmt.Println(err)
+			logger.Error(err)
 			return "", err
 		}
 	}
@@ -310,29 +318,29 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 		keyAndUrls := "1:" + keystr + ";" + fileurl
 		return keyAndUrls, nil
 	}
-	body := extsong(fileurl)
-	fmt.Print("Downloaded\n")
+	body := extsong(fileurl, cb)
+	logger.Info("Downloaded")
 	//bodyReader := bytes.NewReader(body)
 	var buffer bytes.Buffer
 
 	err = DecryptMP4(&body, keybt, &buffer)
 	if err != nil {
-		fmt.Print("Decryption failed\n")
+		logger.Error("Decryption failed")
 		return "", err
 	} else {
-		fmt.Print("Decrypted\n")
+		logger.Info("Decrypted")
 	}
 	// create output file
 	ofh, err := os.Create(trackpath)
 	if err != nil {
-		fmt.Printf("创建文件失败: %v\n", err)
+		logger.Errorf("创建文件失败: %v\n", err)
 		return "", err
 	}
 	defer ofh.Close()
 
 	_, err = ofh.Write(buffer.Bytes())
 	if err != nil {
-		fmt.Printf("写入文件失败: %v\n", err)
+		logger.Errorf("写入文件失败: %v\n", err)
 		return "", err
 	}
 	return "", nil
@@ -353,25 +361,25 @@ func downloadSegment(url string, index int, wg *sync.WaitGroup, segmentsChan cha
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Printf("错误(分段 %d): 创建请求失败: %v\n", index, err)
+		logger.Errorf("错误(分段 %d): 创建请求失败: %v\n", index, err)
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("错误(分段 %d): 下载失败: %v\n", index, err)
+		logger.Errorf("错误(分段 %d): 下载失败: %v\n", index, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("错误(分段 %d): 服务器返回状态码 %d\n", index, resp.StatusCode)
+		logger.Errorf("错误(分段 %d): 服务器返回状态码 %d\n", index, resp.StatusCode)
 		return
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("错误(分段 %d): 读取数据失败: %v\n", index, err)
+		logger.Errorf("错误(分段 %d): 读取数据失败: %v\n", index, err)
 		return
 	}
 
@@ -394,7 +402,7 @@ func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.W
 			//fmt.Printf("写入分段 %d\n", segment.Index)
 			_, err := outputFile.Write(segment.Data)
 			if err != nil {
-				fmt.Printf("错误(分段 %d): 写入文件失败: %v\n", segment.Index, err)
+				logger.Errorf("错误(分段 %d): 写入文件失败: %v\n", segment.Index, err)
 			}
 			nextIndex++
 
@@ -408,7 +416,7 @@ func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.W
 				//fmt.Printf("从缓冲区写入分段 %d\n", nextIndex)
 				_, err := outputFile.Write(data)
 				if err != nil {
-					fmt.Printf("错误(分段 %d): 从缓冲区写入文件失败: %v\n", nextIndex, err)
+					logger.Errorf("错误(分段 %d): 从缓冲区写入文件失败: %v\n", nextIndex, err)
 				}
 				// 从缓冲区删除已写入的分段，释放内存
 				delete(segmentBuffer, nextIndex)
@@ -423,7 +431,7 @@ func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.W
 
 	// 确保所有分段都已写入
 	if nextIndex != totalSegments {
-		fmt.Printf("警告: 写入完成，但似乎有分段丢失。期望 %d 个, 实际写入 %d 个。\n", totalSegments, nextIndex)
+		logger.Warnf("警告: 写入完成，但似乎有分段丢失。期望 %d 个, 实际写入 %d 个。\n", totalSegments, nextIndex)
 	}
 }
 
@@ -434,7 +442,7 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 	urls := segments[1:]
 	tempFile, err := os.CreateTemp("", "enc_mv_data-*.mp4")
 	if err != nil {
-		fmt.Printf("创建文件失败：%v\n", err)
+		logger.Errorf("创建文件失败：%v\n", err)
 		return err
 	}
 	defer os.Remove(tempFile.Name())
@@ -449,12 +457,12 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 	client := &http.Client{}
 
 	// 初始化进度条
-	bar := progressbar.DefaultBytes(-1, "Downloading...")
-	barWriter := io.MultiWriter(tempFile, bar)
+	//bar := progressbar.DefaultBytes(-1, "Downloading...")
+	//barWriter := io.MultiWriter(tempFile, bar)
 
 	// 启动写入 Goroutine
 	writerWg.Add(1)
-	go fileWriter(&writerWg, segmentsChan, barWriter, len(urls))
+	go fileWriter(&writerWg, segmentsChan, tempFile, len(urls))
 
 	// 启动下载 Goroutines
 	for i, url := range urls {
@@ -479,20 +487,20 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 
 	// 显式关闭文件（defer会再次调用，但重复关闭是安全的）
 	if err := tempFile.Close(); err != nil {
-		fmt.Printf("关闭临时文件失败: %v\n", err)
+		logger.Errorf("关闭临时文件失败: %v\n", err)
 		return err
 	}
-	fmt.Println("\nDownloaded.")
+	logger.Info("Downloaded.")
 
 	cmd1 := exec.Command("mp4decrypt", "--key", key, tempFile.Name(), filepath.Base(savePath))
 	cmd1.Dir = filepath.Dir(savePath) //设置mp4decrypt的工作目录以解决中文路径错误
 	outlog, err := cmd1.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Decrypt failed: %v\n", err)
-		fmt.Printf("Output:\n%s\n", outlog)
+		logger.Errorf("Decrypt failed: %v\n", err)
+		logger.Infof("Output:\n%s\n", outlog)
 		return err
 	} else {
-		fmt.Println("Decrypted.")
+		logger.Info("Decrypted.")
 	}
 	return nil
 }

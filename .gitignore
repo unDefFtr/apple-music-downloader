@@ -1,9 +1,38 @@
-*
-!.gitignore
-!agent.js
-!agent-arm64.js
-!go.mod
-!go.sum
-!main.go
-!README.md
-!utils/*
+# Binaries
+# --------------------
+main
+amd
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDEs and Editors
+# --------------------
+.idea/
+.vscode/
+.trae/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Dependencies
+# --------------------
+vendor/
+
+# Logs
+# --------------------
+*.log
+
+# Project Specific
+# --------------------
+# Configuration file containing secrets
+config.yaml
+
+# Download directories
+AM-DL downloads/
+AM-DL-Atmos downloads/
+AM-DL-AAC downloads/

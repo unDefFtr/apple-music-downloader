@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,14 +17,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/utils/ampapi"
+	"main/utils/logger"
 	"main/utils/lyrics"
 	"main/utils/runv2"
 	"main/utils/runv3"
 	"main/utils/structs"
 	"main/utils/task"
+	"main/utils/tui"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
@@ -52,6 +54,10 @@ var (
 	Config         structs.ConfigSet
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
+	mu             sync.Mutex
+	thread_num     *int
+	taskTotal      int
+	decryptSem     chan struct{} // Semaphore for decryption
 )
 
 func loadConfig() error {
@@ -161,7 +167,7 @@ func getUrlSong(songUrl string, token string) (string, error) {
 	storefront, songId := checkUrlSong(songUrl)
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {
-		fmt.Println("\u26A0 Failed to get manifest:", err)
+		logger.Errorf("Failed to get manifest: %v", err)
 		counter.NotSong++
 		return "", err
 	}
@@ -338,7 +344,7 @@ func writeCover(sanAlbumFolder, name string, url string) (string, error) {
 	}
 	exists, err := fileExists(covPath)
 	if err != nil {
-		fmt.Println("Failed to check if cover exists.")
+		logger.Error("Failed to check if cover exists.")
 		return "", err
 	}
 	if exists {
@@ -366,26 +372,26 @@ func writeCover(sanAlbumFolder, name string, url string) (string, error) {
 	defer do.Body.Close()
 	if do.StatusCode != http.StatusOK {
 		if Config.CoverFormat == "original" {
-			fmt.Println("Failed to get cover, falling back to " + ext + " url.")
+			logger.Warn("Failed to get cover, falling back to " + ext + " url.")
 			splitByDot := strings.Split(originalUrl, ".")
 			last := splitByDot[len(splitByDot)-1]
 			fallback := originalUrl[:len(originalUrl)-len(last)] + ext
 			fallback = strings.Replace(fallback, "{w}x{h}", Config.CoverSize, 1)
-			fmt.Println("Fallback URL:", fallback)
+			logger.Infof("Fallback URL: %s", fallback)
 			req, err = http.NewRequest("GET", fallback, nil)
 			if err != nil {
-				fmt.Println("Failed to create request for fallback url.")
+				logger.Error("Failed to create request for fallback url.")
 				return "", err
 			}
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 			do, err = http.DefaultClient.Do(req)
 			if err != nil {
-				fmt.Println("Failed to get cover from fallback url.")
+				logger.Error("Failed to get cover from fallback url.")
 				return "", err
 			}
 			defer do.Body.Close()
 			if do.StatusCode != http.StatusOK {
-				fmt.Println(fallback)
+				logger.Info(fallback)
 				return "", errors.New(do.Status)
 			}
 		} else {
@@ -452,24 +458,24 @@ func setDlFlags(quality string) {
 	switch quality {
 	case "atmos":
 		dl_atmos = true
-		fmt.Println("Quality set to: Dolby Atmos")
+		logger.Info("Quality set to: Dolby Atmos")
 	case "aac":
 		dl_aac = true
 		*aac_type = "aac"
-		fmt.Println("Quality set to: High-Quality (AAC)")
+		logger.Info("Quality set to: High-Quality (AAC)")
 	case "alac":
-		fmt.Println("Quality set to: Lossless (ALAC)")
+		logger.Info("Quality set to: Lossless (ALAC)")
 	}
 }
 
 // promptForQuality asks the user to select a download quality for the chosen media.
 func promptForQuality(item SearchResultItem, token string) (string, error) {
 	if item.Type == "Artist" {
-		fmt.Println("Artist selected. Proceeding to list all albums/videos.")
+		logger.Info("Artist selected. Proceeding to list all albums/videos.")
 		return "default", nil
 	}
 
-	fmt.Printf("\nFetching available qualities for: %s\n", item.Name)
+	logger.Infof("Fetching available qualities for: %s", item.Name)
 
 	qualities := []QualityOption{
 		{ID: "alac", Description: "Lossless (ALAC)"},
@@ -505,7 +511,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 		return "", fmt.Errorf("invalid search type: %s. Use 'album', 'song', or 'artist'", searchType)
 	}
 
-	fmt.Printf("Searching for %ss: \"%s\" in storefront \"%s\"\n", searchType, query, Config.Storefront)
+	logger.Infof("Searching for %ss: \"%s\" in storefront \"%s\"", searchType, query, Config.Storefront)
 
 	offset := 0
 	limit := 15 // Increased limit for better navigation
@@ -570,7 +576,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 		}
 
 		if len(items) == 0 && offset == 0 {
-			fmt.Println("No results found.")
+			logger.Info("No results found.")
 			return "", nil
 		}
 
@@ -622,7 +628,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 			return "", fmt.Errorf("could not process quality selection: %w", err)
 		}
 		if quality == "" { // User cancelled quality selection
-			fmt.Println("Selection cancelled.")
+			logger.Info("Selection cancelled.")
 			return "", nil
 		}
 
@@ -693,13 +699,13 @@ func convertIfNeeded(track *task.Track) {
 
 	// Map extension for output
 	if targetFmt == "copy" {
-		fmt.Println("Convert (copy) requested; skipping because it produces no new format.")
+		logger.Info("Convert (copy) requested; skipping because it produces no new format.")
 		return
 	}
 
 	if Config.ConvertSkipIfSourceMatch {
 		if ext == "."+targetFmt {
-			fmt.Printf("Conversion skipped (already %s)\n", targetFmt)
+			logger.Infof("Conversion skipped (already %s)", targetFmt)
 			return
 		}
 	}
@@ -710,44 +716,44 @@ func convertIfNeeded(track *task.Track) {
 	// Handle lossy -> lossless cases: optionally skip or warn
 	if (targetFmt == "flac" || targetFmt == "wav") && isLossySource(ext, track.Codec) {
 		if Config.ConvertSkipLossyToLossless {
-			fmt.Println("Skipping conversion: source appears lossy and target is lossless; configured to skip.")
+			logger.Info("Skipping conversion: source appears lossy and target is lossless; configured to skip.")
 			return
 		}
 		if Config.ConvertWarnLossyToLossless {
-			fmt.Println("Warning: Converting lossy source to lossless container will not improve quality.")
+			logger.Warn("Warning: Converting lossy source to lossless container will not improve quality.")
 		}
 	}
 
 	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
-		fmt.Printf("ffmpeg not found at '%s'; skipping conversion.\n", Config.FFmpegPath)
+		logger.Warnf("ffmpeg not found at '%s'; skipping conversion.", Config.FFmpegPath)
 		return
 	}
 
 	args, err := buildFFmpegArgs(Config.FFmpegPath, srcPath, outPath, targetFmt, Config.ConvertExtraArgs)
 	if err != nil {
-		fmt.Println("Conversion config error:", err)
+		logger.Errorf("Conversion config error: %v", err)
 		return
 	}
 
-	fmt.Printf("Converting -> %s ...\n", targetFmt)
+	logger.Infof("Converting -> %s ...\n", targetFmt)
 	cmd := exec.Command(Config.FFmpegPath, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	start := time.Now()
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Conversion failed:", err)
+		logger.Error("Conversion failed:", err)
 		// leave original
 		return
 	}
-	fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
+	logger.Infof("Conversion completed in %s: %s", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
 
 	if !Config.ConvertKeepOriginal {
 		if err := os.Remove(srcPath); err != nil {
-			fmt.Println("Failed to remove original after conversion:", err)
+			logger.Errorf("Failed to remove original after conversion: %v", err)
 		} else {
 			track.SavePath = outPath
 			track.SaveName = filepath.Base(outPath)
-			fmt.Println("Original removed.")
+			logger.Info("Original removed.")
 		}
 	} else {
 		// Keep both but point track to new file (optional decision)
@@ -756,11 +762,123 @@ func convertIfNeeded(track *task.Track) {
 	}
 }
 
-func ripTrack(track *task.Track, token string, mediaUserToken string) {
-	var err error
-	counter.Total++
-	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
+func ripTrack(track *task.Track, token string, mediaUserToken string, downloadSem chan struct{}) {
+	// Acquire download sem if not already acquired?
+	// The caller passes downloadSem. We assume caller ACQUIRED it.
+	// We will release it when download is done.
+	defer func() {
+		// Ensure we drain the semaphore if we exit early
+		// But wait, if we spawn a goroutine for decrypt, we shouldn't drain it here if we passed it?
+		// No, ripTrack logic:
+		// 1. Download (holding downloadSem)
+		// 2. Release downloadSem
+		// 3. Acquire decryptSem
+		// 4. Decrypt
+		// 5. Release decryptSem
+	}()
 
+	tui.AddTask(track.ID, track.Name)
+	incrementTotal()
+	logger.Infof("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
+
+	var err error
+	var dCtx *runv2.DecryptionContext
+	var tempFile string
+
+	maxRetries := 3
+
+	// Phase 1: Download
+	for i := 0; i <= maxRetries; i++ {
+		// Define callback for download phase
+		cb := func(p float64, msg string, speed float64) {
+			tui.UpdateTask(track.ID, p, msg, "downloading", speed)
+		}
+
+		dCtx, tempFile, err = doRipTrackDownload(track, token, mediaUserToken, cb)
+		if err == nil {
+			break
+		}
+
+		if err.Error() == "Unavailable" || err.Error() == "Invalid media-user-token" {
+			break
+		}
+
+		if i == maxRetries {
+			break
+		}
+
+		logger.Warnf("Task %s Download failed: %v. Retrying (%d/%d)...", track.Name, err, i+1, maxRetries)
+		tui.UpdateTask(track.ID, 0, fmt.Sprintf("Download Retry (%d/%d)...", i+1, maxRetries), "downloading", 0)
+		time.Sleep(2 * time.Second)
+	}
+
+	// Release Download Semaphore
+	<-downloadSem
+
+	if err != nil {
+		logger.Errorf("Task %s failed: %v", track.Name, err)
+		tui.UpdateTask(track.ID, 0, "Failed", "error", 0)
+		if err.Error() == "Unavailable" {
+			incrementUnavailable()
+		} else {
+			incrementError()
+		}
+		return
+	}
+
+	// If no decryption context, it means it was a v3 track or handled otherwise (skipped/exists)
+	if dCtx == nil {
+		// Check if it was actually skipped or done
+		// If tempFile is empty, it might mean it exists or v3 handled it
+		// We should increment success here if err was nil
+		incrementSuccess()
+		addToOkDict(track.PreID, track.TaskNum)
+		tui.UpdateTask(track.ID, 1.0, "Done", "done", 0)
+		return
+	}
+
+	// Phase 2: Decrypt
+	// Acquire Decrypt Semaphore
+	decryptSem <- struct{}{}
+	defer func() { <-decryptSem }()
+
+	for i := 0; i <= maxRetries; i++ {
+		cb := func(p float64, msg string, speed float64) {
+			tui.UpdateTask(track.ID, p, msg, "decrypting", speed)
+		}
+
+		err = doRipTrackDecrypt(track, dCtx, tempFile, cb)
+		if err == nil {
+			break
+		}
+
+		if i == maxRetries {
+			break
+		}
+
+		logger.Warnf("Task %s Decrypt failed: %v. Retrying (%d/%d)...", track.Name, err, i+1, maxRetries)
+		tui.UpdateTask(track.ID, 0, fmt.Sprintf("Decrypt Retry (%d/%d)...", i+1, maxRetries), "decrypting", 0)
+		time.Sleep(2 * time.Second)
+	}
+
+	// Clean up temp file
+	os.Remove(tempFile)
+
+	if err != nil {
+		logger.Errorf("Task %s Decryption failed: %v", track.Name, err)
+		tui.UpdateTask(track.ID, 0, "Decrypt Failed", "error", 0)
+		incrementError()
+		return
+	}
+
+	incrementSuccess()
+	addToOkDict(track.PreID, track.TaskNum)
+	tui.UpdateTask(track.ID, 1.0, "Done", "done", 0)
+}
+
+// doRipTrackDownload performs the download and returns context for decryption.
+// If it returns nil context and nil error, it means the track is done (e.g. skipped, existing, or v3).
+func doRipTrackDownload(track *task.Track, token string, mediaUserToken string, cb structs.ProgressCallback) (*runv2.DecryptionContext, string, error) {
 	//提前获取到的播放列表下track所在的专辑信息
 	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
 		track.GetAlbumData(token)
@@ -769,23 +887,19 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	//mv dl dev
 	if track.Type == "music-videos" {
 		if len(mediaUserToken) <= 50 {
-			fmt.Println("meida-user-token is not set, skip MV dl")
-			counter.Success++
-			return
+			logger.Warn("media-user-token is not set, skipping MV dl")
+			return nil, "", nil
 		}
 		if _, err := exec.LookPath("mp4decrypt"); err != nil {
-			fmt.Println("mp4decrypt is not found, skip MV dl")
-			counter.Success++
-			return
+			logger.Warn("mp4decrypt is not found, skipping MV dl")
+			return nil, "", nil
 		}
-		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
+		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track, cb)
 		if err != nil {
-			fmt.Println("\u26A0 Failed to dl MV:", err)
-			counter.Error++
-			return
+			logger.Errorf("Failed to dl MV: %v", err)
+			return nil, "", err
 		}
-		counter.Success++
-		return
+		return nil, "", nil
 	}
 
 	needDlAacLc := false
@@ -794,11 +908,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	if track.WebM3u8 == "" && !needDlAacLc {
 		if dl_atmos {
-			fmt.Println("Unavailable")
-			counter.Unavailable++
-			return
+			logger.Warn("Unavailable")
+			return nil, "", errors.New("Unavailable")
 		}
-		fmt.Println("Unavailable, trying to dl aac-lc")
+		logger.Warn("Unavailable, trying to dl aac-lc")
 		needDlAacLc = true
 	}
 	needCheck := false
@@ -823,11 +936,11 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		} else if needDlAacLc {
 			Quality = "256Kbps"
 		} else {
+			var err error
 			_, Quality, err = extractMedia(track.M3u8, true)
 			if err != nil {
-				fmt.Println("Failed to extract quality from manifest.\n", err)
-				counter.Error++
-				return
+				logger.Errorf("Failed to extract quality from manifest: %v", err)
+				return nil, "", err
 			}
 		}
 	}
@@ -861,7 +974,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		"{Tag}", Tag_string,
 		"{Codec}", track.Codec,
 	).Replace(Config.SongFileFormat)
-	fmt.Println(songName)
+	logger.Info(songName)
 	filename := fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
 	track.SaveName = filename
 	trackPath := filepath.Join(track.SaveDir, track.SaveName)
@@ -882,12 +995,12 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if Config.EmbedLrc || Config.SaveLrcFile {
 		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
 		if err != nil {
-			fmt.Println(err)
+			logger.Error(err)
 		} else {
 			if Config.SaveLrcFile {
 				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
 				if err != nil {
-					fmt.Printf("Failed to write lyrics")
+					logger.Error("Failed to write lyrics")
 				}
 			}
 			if Config.EmbedLrc {
@@ -895,59 +1008,108 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			}
 		}
 	}
+	track.Lrc = lrc // Store lrc in track for phase 2
 
 	// Existence check now considers converted output (if original was deleted)
 	existsOriginal, err := fileExists(trackPath)
 	if err != nil {
-		fmt.Println("Failed to check if track exists.")
+		logger.Error("Failed to check if track exists.")
 	}
 	if existsOriginal {
-		fmt.Println("Track already exists locally.")
-		counter.Success++
-		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
-		return
+		logger.Info("Track already exists locally.")
+		return nil, "", nil
 	}
 	if considerConverted {
 		existsConverted, err2 := fileExists(convertedPath)
 		if err2 == nil && existsConverted {
-			fmt.Println("Converted track already exists locally.")
-			counter.Success++
-			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
-			return
+			logger.Info("Converted track already exists locally.")
+			return nil, "", nil
 		}
 	}
 
 	if needDlAacLc {
 		if len(mediaUserToken) <= 50 {
-			fmt.Println("Invalid media-user-token")
-			counter.Error++
-			return
+			logger.Error("Invalid media-user-token")
+			return nil, "", errors.New("Invalid media-user-token")
 		}
-		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "")
+		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "", cb)
 		if err != nil {
-			fmt.Println("Failed to dl aac-lc:", err)
-			if err.Error() == "Unavailable" {
-				counter.Unavailable++
-				return
-			}
-			counter.Error++
-			return
+			logger.Errorf("Failed to dl aac-lc: %v", err)
+			return nil, "", err
 		}
+		// AAC-LC (runv3) is done here. No Phase 2 needed (or we can move tagging there but runv3 might do it?)
+		// runv3.Run calls internal DecryptMP4 which does the job.
+		// However, we still need to run tagging and conversion!
+		// But runv3 logic is self-contained.
+		// Actually, let's look at old doRipTrack.
+		// It calls runv3.Run, then proceeds to "Tags" block.
+		// So we SHOULD return success here, but NO DecryptionContext, but indicate we need post-processing?
+		// My refactor assumes if dCtx is nil, we are done.
+		// But runv3 needs tagging.
+		// Let's perform tagging/conversion here for v3 tracks for simplicity, as they don't block the decryptSem.
+
+		tags := []string{
+			"tool=",
+			"artist=AppleMusic",
+		}
+		if Config.EmbedCover {
+			if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+				track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
+				if err != nil {
+					logger.Error("Failed to write cover.")
+				}
+			}
+			tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
+		}
+		tagsString := strings.Join(tags, ":")
+		cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
+		if err := cmd.Run(); err != nil {
+			logger.Errorf("Embed failed: %v\n", err)
+			return nil, "", err
+		}
+		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+			if err := os.Remove(track.CoverPath); err != nil {
+				logger.Errorf("Error deleting file: %s", track.CoverPath)
+			}
+		}
+		track.SavePath = trackPath
+		err = writeMP4Tags(track, lrc)
+		if err != nil {
+			logger.Errorf("Failed to write tags in media: %v", err)
+			return nil, "", errors.New("Unavailable")
+		}
+		convertIfNeeded(track)
+
+		return nil, "", nil
 	} else {
 		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
 		if err != nil {
-			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
-			counter.Unavailable++
-			return
+			logger.Errorf("Failed to extract info from manifest: %v", err)
+			return nil, "", errors.New("Unavailable")
 		}
-		//边下载边解密
-		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
+
+		// Use a temporary file for download
+		tempFile := trackPath + ".enc"
+		ctx, err := runv2.Download(track.ID, trackM3u8Url, tempFile, Config, cb)
 		if err != nil {
-			fmt.Println("Failed to run v2:", err)
-			counter.Error++
-			return
+			logger.Errorf("Failed to download v2: %v", err)
+			os.Remove(tempFile)
+			return nil, "", err
 		}
+
+		return ctx, tempFile, nil
 	}
+}
+
+func doRipTrackDecrypt(track *task.Track, dCtx *runv2.DecryptionContext, tempFile string, cb structs.ProgressCallback) error {
+	trackPath := filepath.Join(track.SaveDir, track.SaveName)
+
+	err := runv2.Decrypt(dCtx, tempFile, trackPath, cb)
+	if err != nil {
+		logger.Errorf("Failed to decrypt v2: %v", err)
+		return err
+	}
+
 	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
 	tags := []string{
 		"tool=",
@@ -957,7 +1119,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
 			if err != nil {
-				fmt.Println("Failed to write cover.")
+				logger.Error("Failed to write cover.")
 			}
 		}
 		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
@@ -965,30 +1127,26 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	tagsString := strings.Join(tags, ":")
 	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("Embed failed: %v\n", err)
-		counter.Error++
-		return
+		logger.Errorf("Embed failed: %v\n", err)
+		return err
 	}
 	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 		if err := os.Remove(track.CoverPath); err != nil {
-			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
-			counter.Error++
-			return
+			logger.Errorf("Error deleting file: %s", track.CoverPath)
+			return err
 		}
 	}
 	track.SavePath = trackPath
-	err = writeMP4Tags(track, lrc)
+	err = writeMP4Tags(track, track.Lrc)
 	if err != nil {
-		fmt.Println("\u26A0 Failed to write tags in media:", err)
-		counter.Unavailable++
-		return
+		logger.Errorf("Failed to write tags in media: %v", err)
+		return errors.New("Unavailable")
 	}
 
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
 
-	counter.Success++
-	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+	return nil
 }
 
 func ripStation(albumId string, token string, storefront string, mediaUserToken string) error {
@@ -997,7 +1155,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	if err != nil {
 		return err
 	}
-	fmt.Println(" -", station.Type)
+	logger.Info(" -", station.Type)
 	meta := station.Resp
 
 	var Codec string
@@ -1020,7 +1178,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
 		}
 		singerFoldername = strings.TrimSpace(singerFoldername)
-		fmt.Println(singerFoldername)
+		logger.Info(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	if dl_atmos {
@@ -1047,34 +1205,34 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	playlistFolderPath := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(playlistFolder, "_"))
 	os.MkdirAll(playlistFolderPath, os.ModePerm)
 	station.SaveName = playlistFolder
-	fmt.Println(playlistFolder)
+	logger.Info(playlistFolder)
 
 	covPath, err := writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
 	if err != nil {
-		fmt.Println("Failed to write cover.")
+		logger.Error("Failed to write cover.")
 	}
 	station.CoverPath = covPath
 
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video != "" {
-		fmt.Println("Found Animation Artwork.")
+		logger.Info("Found Animation Artwork.")
 
 		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video)
 		if err != nil {
-			fmt.Println("no motion video square.\n", err)
+			logger.Errorf("no motion video square.\n%v", err)
 		} else {
 			exists, err := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 			if err != nil {
-				fmt.Println("Failed to check if animated artwork square exists.")
+				logger.Error("Failed to check if animated artwork square exists.")
 			}
 			if exists {
-				fmt.Println("Animated artwork square already exists locally.")
+				logger.Info("Animated artwork square already exists locally.")
 			} else {
-				fmt.Println("Animation Artwork Square Downloading...")
+				logger.Info("Animation Artwork Square Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("animated artwork square dl err: %v\n", err)
+					logger.Errorf("animated artwork square dl err: %v\n", err)
 				} else {
-					fmt.Println("Animation Artwork Square Downloaded")
+					logger.Info("Animation Artwork Square Downloaded")
 				}
 			}
 		}
@@ -1082,14 +1240,20 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 		if Config.EmbyAnimatedArtwork {
 			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
-				fmt.Printf("animated artwork square to gif err: %v\n", err)
+				logger.Errorf("animated artwork square to gif err: %v\n", err)
 			}
 		}
 	}
 	if station.Type == "stream" {
+		mu.Lock()
+		taskTotal++
+		mu.Unlock()
+		updateTotalProgress()
+
 		counter.Total++
 		if isInArray(okDict[station.ID], 1) {
 			counter.Success++
+			updateTotalProgress()
 			return nil
 		}
 		songName := strings.NewReplacer(
@@ -1102,27 +1266,27 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			"{Tag}", "",
 			"{Codec}", "AAC",
 		).Replace(Config.SongFileFormat)
-		fmt.Println(songName)
+		logger.Info(songName)
 		trackPath := filepath.Join(playlistFolderPath, fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_")))
 		exists, _ := fileExists(trackPath)
 		if exists {
 			counter.Success++
 			okDict[station.ID] = append(okDict[station.ID], 1)
 
-			fmt.Println("Radio already exists locally.")
+			logger.Info("Radio already exists locally.")
 			return nil
 		}
 		assetsUrl, serverUrl, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, mediaUserToken, token)
 		if err != nil {
-			fmt.Println("Failed to get station assets url.", err)
+			logger.Error("Failed to get station assets url.", err)
 			counter.Error++
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		keyAndUrls, _ := runv3.Run(station.ID, trackM3U8, token, mediaUserToken, true, serverUrl)
+		keyAndUrls, _ := runv3.Run(station.ID, trackM3U8, token, mediaUserToken, true, serverUrl, nil)
 		err = runv3.ExtMvData(keyAndUrls, trackPath)
 		if err != nil {
-			fmt.Println("Failed to download station stream.", err)
+			logger.Error("Failed to download station stream.", err)
 			counter.Error++
 			return err
 		}
@@ -1143,7 +1307,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 		tagsString := strings.Join(tags, ":")
 		cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
 		if err := cmd.Run(); err != nil {
-			fmt.Printf("Embed failed: %v\n", err)
+			logger.Errorf("Embed failed: %v\n", err)
 		}
 		counter.Success++
 		okDict[station.ID] = append(okDict[station.ID], 1)
@@ -1166,12 +1330,27 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	if true {
 		selected = arr
 	}
+
+	mu.Lock()
+	taskTotal += len(selected)
+	mu.Unlock()
+	updateTotalProgress()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, Config.ThreadNum)
+
 	for i := range station.Tracks {
 		i++
 		if isInArray(selected, i) {
-			ripTrack(&station.Tracks[i-1], token, mediaUserToken)
+			wg.Add(1)
+			go func(t *task.Track) {
+				defer wg.Done()
+				sem <- struct{}{}
+				ripTrack(t, token, mediaUserToken, sem)
+			}(&station.Tracks[i-1])
 		}
 	}
+	wg.Wait()
 	return nil
 }
 
@@ -1179,22 +1358,22 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
-		fmt.Println("Failed to get album response.")
+		logger.Error("Failed to get album response.")
 		return err
 	}
 	meta := album.Resp
 	if debug_mode {
-		fmt.Println(meta.Data[0].Attributes.ArtistName)
-		fmt.Println(meta.Data[0].Attributes.Name)
+		logger.Info(meta.Data[0].Attributes.ArtistName)
+		logger.Info(meta.Data[0].Attributes.Name)
 
 		for trackNum, track := range meta.Data[0].Relationships.Tracks.Data {
 			trackNum++
-			fmt.Printf("\nTrack %d of %d:\n", trackNum, len(meta.Data[0].Relationships.Tracks.Data))
-			fmt.Printf("%02d. %s\n", trackNum, track.Attributes.Name)
+			logger.Infof("\nTrack %d of %d:\n", trackNum, len(meta.Data[0].Relationships.Tracks.Data))
+			logger.Infof("%02d. %s\n", trackNum, track.Attributes.Name)
 
 			manifest, err := ampapi.GetSongResp(storefront, track.ID, album.Language, token)
 			if err != nil {
-				fmt.Printf("Failed to get manifest for track %d: %v\n", trackNum, err)
+				logger.Errorf("Failed to get manifest for track %d: %v\n", trackNum, err)
 				continue
 			}
 
@@ -1213,13 +1392,13 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 				if err == nil && strings.HasSuffix(fullM3u8Url, ".m3u8") {
 					m3u8Url = fullM3u8Url
 				} else {
-					fmt.Println("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
+					logger.Error("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
 				}
 			}
 
 			_, _, err = extractMedia(m3u8Url, true)
 			if err != nil {
-				fmt.Printf("Failed to extract quality info for track %d: %v\n", trackNum, err)
+				logger.Errorf("Failed to extract quality info for track %d: %v\n", trackNum, err)
 				continue
 			}
 		}
@@ -1253,7 +1432,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
 		}
 		singerFoldername = strings.TrimSpace(singerFoldername)
-		fmt.Println(singerFoldername)
+		logger.Info(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	if dl_atmos {
@@ -1273,7 +1452,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		} else {
 			manifest1, err := ampapi.GetSongResp(storefront, meta.Data[0].Relationships.Tracks.Data[0].ID, album.Language, token)
 			if err != nil {
-				fmt.Println("Failed to get manifest.\n", err)
+				logger.Errorf("Failed to get manifest.\n%v", err)
 			} else {
 				if manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls == "" {
 					Codec = "AAC"
@@ -1295,7 +1474,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 					}
 					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
-						fmt.Println("Failed to extract quality from manifest.\n", err)
+						logger.Errorf("Failed to extract quality from manifest.\n%v", err)
 					}
 				}
 			}
@@ -1340,39 +1519,39 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	albumFolderPath := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(albumFolderName, "_"))
 	os.MkdirAll(albumFolderPath, os.ModePerm)
 	album.SaveName = albumFolderName
-	fmt.Println(albumFolderName)
-	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0{
+	logger.Info(albumFolderName)
+	if Config.SaveArtistCover && len(meta.Data[0].Relationships.Artists.Data) > 0 {
 		if meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url != "" {
 			_, err = writeCover(singerFolder, "folder", meta.Data[0].Relationships.Artists.Data[0].Attributes.Artwork.Url)
 			if err != nil {
-				fmt.Println("Failed to write artist cover.")
+				logger.Error("Failed to write artist cover.")
 			}
 		}
 	}
 	covPath, err := writeCover(albumFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
 	if err != nil {
-		fmt.Println("Failed to write cover.")
+		logger.Error("Failed to write cover.")
 	}
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
-		fmt.Println("Found Animation Artwork.")
+		logger.Info("Found Animation Artwork.")
 
 		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
 		if err != nil {
-			fmt.Println("no motion video square.\n", err)
+			logger.Errorf("no motion video square.\n%v", err)
 		} else {
 			exists, err := fileExists(filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
 			if err != nil {
-				fmt.Println("Failed to check if animated artwork square exists.")
+				logger.Error("Failed to check if animated artwork square exists.")
 			}
 			if exists {
-				fmt.Println("Animated artwork square already exists locally.")
+				logger.Info("Animated artwork square already exists locally.")
 			} else {
-				fmt.Println("Animation Artwork Square Downloading...")
+				logger.Info("Animation Artwork Square Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("animated artwork square dl err: %v\n", err)
+					logger.Errorf("animated artwork square dl err: %v\n", err)
 				} else {
-					fmt.Println("Animation Artwork Square Downloaded")
+					logger.Info("Animation Artwork Square Downloaded")
 				}
 			}
 		}
@@ -1380,27 +1559,27 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		if Config.EmbyAnimatedArtwork {
 			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(albumFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
-				fmt.Printf("animated artwork square to gif err: %v\n", err)
+				logger.Errorf("animated artwork square to gif err: %v\n", err)
 			}
 		}
 
 		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
 		if err != nil {
-			fmt.Println("no motion video tall.\n", err)
+			logger.Errorf("no motion video tall.\n%v", err)
 		} else {
 			exists, err := fileExists(filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
 			if err != nil {
-				fmt.Println("Failed to check if animated artwork tall exists.")
+				logger.Error("Failed to check if animated artwork tall exists.")
 			}
 			if exists {
-				fmt.Println("Animated artwork tall already exists locally.")
+				logger.Info("Animated artwork tall already exists locally.")
 			} else {
-				fmt.Println("Animation Artwork Tall Downloading...")
+				logger.Info("Animation Artwork Tall Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("animated artwork tall dl err: %v\n", err)
+					logger.Errorf("animated artwork tall dl err: %v\n", err)
 				} else {
-					fmt.Println("Animation Artwork Tall Downloaded")
+					logger.Info("Animation Artwork Tall Downloaded")
 				}
 			}
 		}
@@ -1421,7 +1600,16 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		} else {
 			for i := range album.Tracks {
 				if urlArg_i == album.Tracks[i].ID {
-					ripTrack(&album.Tracks[i], token, mediaUserToken)
+					mu.Lock()
+					taskTotal++
+					mu.Unlock()
+					updateTotalProgress()
+					tui.AddTask(album.Tracks[i].ID, album.Tracks[i].Name)
+
+					// Just run synchronously here since it's a single song request in album context
+					sem := make(chan struct{}, 1)
+					sem <- struct{}{}
+					ripTrack(&album.Tracks[i], token, mediaUserToken, sem)
 					return nil
 				}
 			}
@@ -1434,17 +1622,36 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	} else {
 		selected = album.ShowSelect()
 	}
+
+	mu.Lock()
+	taskTotal += len(selected)
+	mu.Unlock()
+	updateTotalProgress()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, Config.ThreadNum)
+
 	for i := range album.Tracks {
 		i++
-		if isInArray(okDict[albumId], i) {
-			counter.Total++
-			counter.Success++
+		if checkOkDict(albumId, i) {
+			incrementTotal()
+			incrementSuccess()
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken)
+			wg.Add(1)
+			go func(t *task.Track) {
+				defer wg.Done()
+
+				// Acquire download slot
+				sem <- struct{}{}
+
+				// This function will handle the entire flow, including acquiring/releasing semaphores
+				ripTrack(t, token, mediaUserToken, sem)
+			}(&album.Tracks[i-1])
 		}
 	}
+	wg.Wait()
 	return nil
 
 }
@@ -1452,22 +1659,22 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
-		fmt.Println("Failed to get playlist response.")
+		logger.Error("Failed to get playlist response.")
 		return err
 	}
 	meta := playlist.Resp
 	if debug_mode {
-		fmt.Println(meta.Data[0].Attributes.ArtistName)
-		fmt.Println(meta.Data[0].Attributes.Name)
+		logger.Info(meta.Data[0].Attributes.ArtistName)
+		logger.Info(meta.Data[0].Attributes.Name)
 
 		for trackNum, track := range meta.Data[0].Relationships.Tracks.Data {
 			trackNum++
-			fmt.Printf("\nTrack %d of %d:\n", trackNum, len(meta.Data[0].Relationships.Tracks.Data))
-			fmt.Printf("%02d. %s\n", trackNum, track.Attributes.Name)
+			logger.Infof("\nTrack %d of %d:\n", trackNum, len(meta.Data[0].Relationships.Tracks.Data))
+			logger.Infof("%02d. %s\n", trackNum, track.Attributes.Name)
 
 			manifest, err := ampapi.GetSongResp(storefront, track.ID, playlist.Language, token)
 			if err != nil {
-				fmt.Printf("Failed to get manifest for track %d: %v\n", trackNum, err)
+				logger.Errorf("Failed to get manifest for track %d: %v\n", trackNum, err)
 				continue
 			}
 
@@ -1486,13 +1693,13 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 				if err == nil && strings.HasSuffix(fullM3u8Url, ".m3u8") {
 					m3u8Url = fullM3u8Url
 				} else {
-					fmt.Println("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
+					logger.Error("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
 				}
 			}
 
 			_, _, err = extractMedia(m3u8Url, true)
 			if err != nil {
-				fmt.Printf("Failed to extract quality info for track %d: %v\n", trackNum, err)
+				logger.Errorf("Failed to extract quality info for track %d: %v\n", trackNum, err)
 				continue
 			}
 		}
@@ -1518,7 +1725,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
 		}
 		singerFoldername = strings.TrimSpace(singerFoldername)
-		fmt.Println(singerFoldername)
+		logger.Info(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	if dl_atmos {
@@ -1539,7 +1746,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		} else {
 			manifest1, err := ampapi.GetSongResp(storefront, meta.Data[0].Relationships.Tracks.Data[0].ID, playlist.Language, token)
 			if err != nil {
-				fmt.Println("Failed to get manifest.\n", err)
+				logger.Errorf("Failed to get manifest.\n%v", err)
 			} else {
 				if manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls == "" {
 					Codec = "AAC"
@@ -1561,7 +1768,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 					}
 					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
-						fmt.Println("Failed to extract quality from manifest.\n", err)
+						logger.Errorf("Failed to extract quality from manifest.\n%v", err)
 					}
 				}
 			}
@@ -1599,10 +1806,10 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	playlistFolderPath := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(playlistFolder, "_"))
 	os.MkdirAll(playlistFolderPath, os.ModePerm)
 	playlist.SaveName = playlistFolder
-	fmt.Println(playlistFolder)
+	logger.Info(playlistFolder)
 	covPath, err := writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
 	if err != nil {
-		fmt.Println("Failed to write cover.")
+		logger.Error("Failed to write cover.")
 	}
 
 	for i := range playlist.Tracks {
@@ -1612,25 +1819,25 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	}
 
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
-		fmt.Println("Found Animation Artwork.")
+		logger.Info("Found Animation Artwork.")
 
 		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
 		if err != nil {
-			fmt.Println("no motion video square.\n", err)
+			logger.Errorf("no motion video square.\n%v", err)
 		} else {
 			exists, err := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 			if err != nil {
-				fmt.Println("Failed to check if animated artwork square exists.")
+				logger.Error("Failed to check if animated artwork square exists.")
 			}
 			if exists {
-				fmt.Println("Animated artwork square already exists locally.")
+				logger.Info("Animated artwork square already exists locally.")
 			} else {
-				fmt.Println("Animation Artwork Square Downloading...")
+				logger.Info("Animation Artwork Square Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("animated artwork square dl err: %v\n", err)
+					logger.Errorf("animated artwork square dl err: %v\n", err)
 				} else {
-					fmt.Println("Animation Artwork Square Downloaded")
+					logger.Info("Animation Artwork Square Downloaded")
 				}
 			}
 		}
@@ -1638,27 +1845,27 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		if Config.EmbyAnimatedArtwork {
 			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
-				fmt.Printf("animated artwork square to gif err: %v\n", err)
+				logger.Errorf("animated artwork square to gif err: %v\n", err)
 			}
 		}
 
 		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
 		if err != nil {
-			fmt.Println("no motion video tall.\n", err)
+			logger.Errorf("no motion video tall.\n%v", err)
 		} else {
 			exists, err := fileExists(filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
 			if err != nil {
-				fmt.Println("Failed to check if animated artwork tall exists.")
+				logger.Error("Failed to check if animated artwork tall exists.")
 			}
 			if exists {
-				fmt.Println("Animated artwork tall already exists locally.")
+				logger.Info("Animated artwork tall already exists locally.")
 			} else {
-				fmt.Println("Animation Artwork Tall Downloading...")
+				logger.Info("Animation Artwork Tall Downloading...")
 				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
-					fmt.Printf("animated artwork tall dl err: %v\n", err)
+					logger.Errorf("animated artwork tall dl err: %v\n", err)
 				} else {
-					fmt.Println("Animation Artwork Tall Downloaded")
+					logger.Info("Animation Artwork Tall Downloaded")
 				}
 			}
 		}
@@ -1675,17 +1882,32 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	} else {
 		selected = playlist.ShowSelect()
 	}
+
+	mu.Lock()
+	taskTotal += len(selected)
+	mu.Unlock()
+	updateTotalProgress()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, Config.ThreadNum)
+
 	for i := range playlist.Tracks {
 		i++
-		if isInArray(okDict[playlistId], i) {
-			counter.Total++
-			counter.Success++
+		if checkOkDict(playlistId, i) {
+			incrementTotal()
+			incrementSuccess()
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
+			wg.Add(1)
+			go func(t *task.Track) {
+				defer wg.Done()
+				sem <- struct{}{}
+				ripTrack(t, token, mediaUserToken, sem)
+			}(&playlist.Tracks[i-1])
 		}
 	}
+	wg.Wait()
 	return nil
 }
 
@@ -1778,10 +2000,57 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 	return nil
 }
 
+func incrementTotal() {
+	mu.Lock()
+	defer mu.Unlock()
+	counter.Total++
+}
+
+func incrementSuccess() {
+	mu.Lock()
+	defer mu.Unlock()
+	counter.Success++
+	updateTotalProgress()
+}
+
+func incrementError() {
+	mu.Lock()
+	defer mu.Unlock()
+	counter.Error++
+	updateTotalProgress()
+}
+
+func incrementUnavailable() {
+	mu.Lock()
+	defer mu.Unlock()
+	counter.Unavailable++
+	updateTotalProgress()
+}
+
+func updateTotalProgress() {
+	if taskTotal > 0 {
+		completed := counter.Success + counter.Error + counter.Unavailable + counter.NotSong
+		percent := float64(completed) / float64(taskTotal)
+		tui.UpdateTotalProgress(percent)
+	}
+}
+
+func addToOkDict(key string, val int) {
+	mu.Lock()
+	defer mu.Unlock()
+	okDict[key] = append(okDict[key], val)
+}
+
+func checkOkDict(key string, val int) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return isInArray(okDict[key], val)
+}
+
 func main() {
 	err := loadConfig()
 	if err != nil {
-		fmt.Printf("load Config failed: %v", err)
+		logger.Errorf("load Config failed: %v", err)
 		return
 	}
 	token, err := ampapi.GetToken()
@@ -1789,7 +2058,7 @@ func main() {
 		if Config.AuthorizationToken != "" && Config.AuthorizationToken != "your-authorization-token" {
 			token = strings.Replace(Config.AuthorizationToken, "Bearer ", "", -1)
 		} else {
-			fmt.Println("Failed to get token.")
+			logger.Error("Failed to get token.")
 			return
 		}
 	}
@@ -1806,6 +2075,7 @@ func main() {
 	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
 	mv_audio_type = pflag.String("mv-audio-type", Config.MVAudioType, "Select MV audio type, atmos ac3 aac")
 	mv_max = pflag.Int("mv-max", Config.MVMax, "Specify the max quality for download MV")
+	thread_num = pflag.Int("thread", 1, "Specify the number of parallel download threads")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [url1 url2 ...]\n", "[main | main.exe | go run main.go]")
@@ -1815,33 +2085,38 @@ func main() {
 	}
 
 	pflag.Parse()
+	logger.Init(debug_mode)
 	Config.AlacMax = *alac_max
 	Config.AtmosMax = *atmos_max
 	Config.AacType = *aac_type
 	Config.MVAudioType = *mv_audio_type
 	Config.MVMax = *mv_max
+	Config.ThreadNum = *thread_num
+
+	// Initialize decryption semaphore with 1 slot
+	decryptSem = make(chan struct{}, 1)
 
 	args := pflag.Args()
 
 	if search_type != "" {
 		if len(args) == 0 {
-			fmt.Println("Error: --search flag requires a query.")
+			logger.Error("Error: --search flag requires a query.")
 			pflag.Usage()
 			return
 		}
 		selectedUrl, err := handleSearch(search_type, args, token)
 		if err != nil {
-			fmt.Printf("\nSearch process failed: %v\n", err)
+			logger.Errorf("\nSearch process failed: %v\n", err)
 			return
 		}
 		if selectedUrl == "" {
-			fmt.Println("\nExiting.")
+			logger.Info("Exiting.")
 			return
 		}
 		os.Args = []string{selectedUrl}
 	} else {
 		if len(args) == 0 {
-			fmt.Println("No URLs provided. Please provide at least one URL.")
+			logger.Error("No URLs provided. Please provide at least one URL.")
 			pflag.Usage()
 			return
 		}
@@ -1851,7 +2126,7 @@ func main() {
 	if strings.Contains(os.Args[0], "/artist/") {
 		urlArtistName, urlArtistID, err := getUrlArtistName(os.Args[0], token)
 		if err != nil {
-			fmt.Println("Failed to get artistname.")
+			logger.Error("Failed to get artistname.")
 			return
 		}
 		Config.ArtistFolderFormat = strings.NewReplacer(
@@ -1860,34 +2135,50 @@ func main() {
 		).Replace(Config.ArtistFolderFormat)
 		albumArgs, err := checkArtist(os.Args[0], token, "albums")
 		if err != nil {
-			fmt.Println("Failed to get artist albums.")
+			logger.Error("Failed to get artist albums.")
 			return
 		}
 		mvArgs, err := checkArtist(os.Args[0], token, "music-videos")
 		if err != nil {
-			fmt.Println("Failed to get artist music-videos.")
+			logger.Error("Failed to get artist music-videos.")
 		}
 		os.Args = append(albumArgs, mvArgs...)
 	}
-	albumTotal := len(os.Args)
+	logger.LogHook = tui.SendLog
+	tui.Init()
+	go func() {
+		runDownloads(os.Args, token)
+	}()
+	if err := tui.Start(); err != nil {
+		panic(err)
+	}
+}
+
+func runDownloads(args []string, token string) {
+	albumTotal := len(args)
 	for {
-		for albumNum, urlRaw := range os.Args {
-			fmt.Printf("Queue %d of %d: ", albumNum+1, albumTotal)
+		for albumNum, urlRaw := range args {
+			logger.Infof("Queue %d of %d: ", albumNum+1, albumTotal)
 			var storefront, albumId string
 
 			if strings.Contains(urlRaw, "/music-video/") {
-				fmt.Println("Music Video")
+				logger.Info("Music Video")
 				if debug_mode {
 					continue
 				}
+				mu.Lock()
+				taskTotal++
+				mu.Unlock()
+				updateTotalProgress()
+
 				counter.Total++
 				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip MV dl")
+					logger.Info(": meida-user-token is not set, skip MV dl")
 					counter.Success++
 					continue
 				}
 				if _, err := exec.LookPath("mp4decrypt"); err != nil {
-					fmt.Println(": mp4decrypt is not found, skip MV dl")
+					logger.Info(": mp4decrypt is not found, skip MV dl")
 					counter.Success++
 					continue
 				}
@@ -1902,9 +2193,14 @@ func main() {
 					mvSaveDir = Config.AlacSaveFolder
 				}
 				storefront, albumId = checkUrlMv(urlRaw)
-				err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil)
+				tui.AddTask(albumId, "Music Video")
+				cb := func(p float64, msg string, speed float64) {
+					tui.UpdateTask(albumId, p, msg, "downloading", speed)
+				}
+				err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil, cb)
+				tui.UpdateTask(albumId, 1.0, "Done", "done", 0)
 				if err != nil {
-					fmt.Println("\u26A0 Failed to dl MV:", err)
+					logger.Errorf("\u26A0 Failed to dl MV: %v", err)
 					counter.Error++
 					continue
 				}
@@ -1912,68 +2208,68 @@ func main() {
 				continue
 			}
 			if strings.Contains(urlRaw, "/song/") {
-				fmt.Printf("Song->")
+				logger.Info("Song->")
 				storefront, songId := checkUrlSong(urlRaw)
 				if storefront == "" || songId == "" {
-					fmt.Println("Invalid song URL format.")
+					logger.Error("Invalid song URL format.")
 					continue
 				}
 				err := ripSong(songId, token, storefront, Config.MediaUserToken)
 				if err != nil {
-					fmt.Println("Failed to rip song:", err)
+					logger.Error("Failed to rip song:", err)
 				}
 				continue
 			}
 			parse, err := url.Parse(urlRaw)
 			if err != nil {
-				log.Fatalf("Invalid URL: %v", err)
+				logger.Fatalf("Invalid URL: %v", err)
 			}
 			var urlArg_i = parse.Query().Get("i")
 
 			if strings.Contains(urlRaw, "/album/") {
-				fmt.Println("Album")
+				logger.Info("Album")
 				storefront, albumId = checkUrl(urlRaw)
 				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i)
 				if err != nil {
-					fmt.Println("Failed to rip album:", err)
+					logger.Errorf("Failed to rip album: %v", err)
 				}
 			} else if strings.Contains(urlRaw, "/playlist/") {
-				fmt.Println("Playlist")
+				logger.Info("Playlist")
 				storefront, albumId = checkUrlPlaylist(urlRaw)
 				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
-					fmt.Println("Failed to rip playlist:", err)
+					logger.Errorf("Failed to rip playlist: %v", err)
 				}
 			} else if strings.Contains(urlRaw, "/station/") {
-				fmt.Printf("Station")
+				logger.Info("Station")
 				storefront, albumId = checkUrlStation(urlRaw)
 				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip station dl")
+					logger.Info(": meida-user-token is not set, skip station dl")
 					continue
 				}
 				err := ripStation(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
-					fmt.Println("Failed to rip station:", err)
+					logger.Errorf("Failed to rip station: %v", err)
 				}
 			} else {
-				fmt.Println("Invalid type")
+				logger.Error("Invalid type")
 			}
 		}
-		fmt.Printf("=======  [\u2714 ] Completed: %d/%d  |  [\u26A0 ] Warnings: %d  |  [\u2716 ] Errors: %d  =======\n", counter.Success, counter.Total, counter.Unavailable+counter.NotSong, counter.Error)
+		logger.Infof("=======  [\u2714 ] Completed: %d/%d  |  [\u26A0 ] Warnings: %d  |  [\u2716 ] Errors: %d  =======\n", counter.Success, counter.Total, counter.Unavailable+counter.NotSong, counter.Error)
 		if counter.Error == 0 {
 			break
 		}
-		fmt.Println("Error detected, press Enter to try again...")
+		logger.Info("Error detected, press Enter to try again...")
 		fmt.Scanln()
-		fmt.Println("Start trying again...")
+		logger.Info("Start trying again...")
 		counter = structs.Counter{}
 	}
 }
 
-func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
+func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track, cb structs.ProgressCallback) error {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
-		fmt.Println("\u26A0 Failed to get MV manifest:", err)
+		logger.Errorf("Failed to get MV manifest: %v", err)
 		return nil
 	}
 
@@ -1991,11 +2287,11 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	mvOutPath := filepath.Join(saveDir, fmt.Sprintf("%s.mp4", forbiddenNames.ReplaceAllString(mvSaveName, "_")))
 
-	fmt.Println(MVInfo.Data[0].Attributes.Name)
+	logger.Info(MVInfo.Data[0].Attributes.Name)
 
 	exists, _ := fileExists(mvOutPath)
 	if exists {
-		fmt.Println("MV already exists locally.")
+		logger.Info("MV already exists locally.")
 		return nil
 	}
 
@@ -2006,11 +2302,19 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	videokeyAndUrls, _ := runv3.Run(adamID, videom3u8url, token, mediaUserToken, true, "")
+	videokeyAndUrls, _ := runv3.Run(adamID, videom3u8url, token, mediaUserToken, true, "", func(p float64, msg string, speed float64) {
+		if cb != nil {
+			cb(p, "Downloading MV Video", speed)
+		}
+	})
 	_ = runv3.ExtMvData(videokeyAndUrls, vidPath)
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	audiokeyAndUrls, _ := runv3.Run(adamID, audiom3u8url, token, mediaUserToken, true, "")
+	audiokeyAndUrls, _ := runv3.Run(adamID, audiom3u8url, token, mediaUserToken, true, "", func(p float64, msg string, speed float64) {
+		if cb != nil {
+			cb(p, "Downloading MV Audio", speed)
+		}
+	})
 	_ = runv3.ExtMvData(audiokeyAndUrls, audPath)
 	defer os.Remove(audPath)
 
@@ -2072,7 +2376,7 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 		baseThumbName := forbiddenNames.ReplaceAllString(mvSaveName, "_") + "_thumbnail"
 		covPath, err = writeCover(saveDir, baseThumbName, thumbURL)
 		if err != nil {
-			fmt.Println("Failed to save MV thumbnail:", err)
+			logger.Errorf("Failed to save MV thumbnail: %v", err)
 		} else {
 			tags = append(tags, fmt.Sprintf("cover=%s", covPath))
 		}
@@ -2081,12 +2385,12 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	tagsString := strings.Join(tags, ":")
 	muxCmd := exec.Command("MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
-	fmt.Printf("MV Remuxing...")
+	logger.Infof("MV Remuxing...")
 	if err := muxCmd.Run(); err != nil {
-		fmt.Printf("MV mux failed: %v\n", err)
+		logger.Errorf("MV mux failed: %v\n", err)
 		return err
 	}
-	fmt.Printf("\rMV Remuxed.   \n")
+	logger.Info("MV Remuxed.")
 	return nil
 }
 
@@ -2164,7 +2468,7 @@ func extractMvAudio(c string) (string, error) {
 	sort.Slice(audioStreams, func(i, j int) bool {
 		return audioStreams[i].Rank > audioStreams[j].Rank
 	})
-	fmt.Println("Audio: " + audioStreams[0].GroupID)
+	logger.Info("Audio: " + audioStreams[0].GroupID)
 	return audioStreams[0].URL, nil
 }
 
@@ -2174,12 +2478,12 @@ func checkM3u8(b string, f string) (string, error) {
 		adamID := b
 		conn, err := net.Dial("tcp", Config.GetM3u8Port)
 		if err != nil {
-			fmt.Println("Error connecting to device:", err)
+			logger.Errorf("Error connecting to device: %v", err)
 			return "none", err
 		}
 		defer conn.Close()
 		if f == "song" {
-			fmt.Println("Connected to device")
+			logger.Info("Connected to device")
 		}
 
 		adamIDBuffer := []byte(adamID)
@@ -2187,30 +2491,30 @@ func checkM3u8(b string, f string) (string, error) {
 
 		_, err = conn.Write(lengthBuffer)
 		if err != nil {
-			fmt.Println("Error writing length to device:", err)
+			logger.Errorf("Error writing length to device: %v", err)
 			return "none", err
 		}
 
 		_, err = conn.Write(adamIDBuffer)
 		if err != nil {
-			fmt.Println("Error writing adamID to device:", err)
+			logger.Errorf("Error writing adamID to device: %v", err)
 			return "none", err
 		}
 
 		response, err := bufio.NewReader(conn).ReadBytes('\n')
 		if err != nil {
-			fmt.Println("Error reading response from device:", err)
+			logger.Errorf("Error reading response from device: %v", err)
 			return "none", err
 		}
 
 		response = bytes.TrimSpace(response)
 		if len(response) > 0 {
 			if f == "song" {
-				fmt.Println("Received URL:", string(response))
+				logger.Infof("Received URL: %s", string(response))
 			}
 			EnhancedHls = string(response)
 		} else {
-			fmt.Println("Received an empty response")
+			logger.Warn("Received an empty response")
 		}
 	}
 	return EnhancedHls, nil
@@ -2251,7 +2555,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 		return master.Variants[i].AverageBandwidth > master.Variants[j].AverageBandwidth
 	})
 	if debug_mode && more_mode {
-		fmt.Println("\nDebug: All Available Variants:")
+		logger.Debug("All Available Variants:")
 		var data [][]string
 		for _, variant := range master.Variants {
 			data = append(data, []string{variant.Codecs, variant.Audio, fmt.Sprint(variant.Bandwidth)})
@@ -2324,14 +2628,14 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 			}
 		}
 
-		fmt.Println("Available Audio Formats:")
-		fmt.Println("------------------------")
-		fmt.Printf("AAC             : %s\n", formatAvailability(hasAAC, aacQuality))
-		fmt.Printf("Lossless        : %s\n", formatAvailability(hasLossless, losslessQuality))
-		fmt.Printf("Hi-Res Lossless : %s\n", formatAvailability(hasHiRes, hiResQuality))
-		fmt.Printf("Dolby Atmos     : %s\n", formatAvailability(hasAtmos, atmosQuality))
-		fmt.Printf("Dolby Audio     : %s\n", formatAvailability(hasDolbyAudio, dolbyAudioQuality))
-		fmt.Println("------------------------")
+		logger.Info("Available Audio Formats:")
+		logger.Info("------------------------")
+		logger.Infof("AAC             : %s\n", formatAvailability(hasAAC, aacQuality))
+		logger.Infof("Lossless        : %s\n", formatAvailability(hasLossless, losslessQuality))
+		logger.Infof("Hi-Res Lossless : %s\n", formatAvailability(hasHiRes, hiResQuality))
+		logger.Infof("Dolby Atmos     : %s\n", formatAvailability(hasAtmos, atmosQuality))
+		logger.Infof("Dolby Audio     : %s\n", formatAvailability(hasDolbyAudio, dolbyAudioQuality))
+		logger.Info("------------------------")
 
 		return "", "", nil
 	}
@@ -2340,7 +2644,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 		if dl_atmos {
 			if variant.Codecs == "ec-3" && strings.Contains(variant.Audio, "atmos") {
 				if debug_mode && !more_mode {
-					fmt.Printf("Debug: Found Dolby Atmos variant - %s (Bitrate: %d Kbps)\n",
+					logger.Infof("Debug: Found Dolby Atmos variant - %s (Bitrate: %d Kbps)\n",
 						variant.Audio, variant.Bandwidth/1000)
 				}
 				split := strings.Split(variant.Audio, "-")
@@ -2351,7 +2655,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				}
 				if length_int <= Config.AtmosMax {
 					if !debug_mode && !more_mode {
-						fmt.Printf("%s\n", variant.Audio)
+						logger.Infof("%s\n", variant.Audio)
 					}
 					streamUrlTemp, err := masterUrl.Parse(variant.URI)
 					if err != nil {
@@ -2363,7 +2667,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				}
 			} else if variant.Codecs == "ac-3" { // Add Dolby Audio support
 				if debug_mode && !more_mode {
-					fmt.Printf("Debug: Found Dolby Audio variant - %s (Bitrate: %d Kbps)\n",
+					logger.Infof("Debug: Found Dolby Audio variant - %s (Bitrate: %d Kbps)\n",
 						variant.Audio, variant.Bandwidth/1000)
 				}
 				streamUrlTemp, err := masterUrl.Parse(variant.URI)
@@ -2378,13 +2682,13 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 		} else if dl_aac {
 			if variant.Codecs == "mp4a.40.2" {
 				if debug_mode && !more_mode {
-					fmt.Printf("Debug: Found AAC variant - %s (Bitrate: %d)\n", variant.Audio, variant.Bandwidth)
+					logger.Infof("Debug: Found AAC variant - %s (Bitrate: %d)\n", variant.Audio, variant.Bandwidth)
 				}
 				aacregex := regexp.MustCompile(`audio-stereo-\d+`)
 				replaced := aacregex.ReplaceAllString(variant.Audio, "aac")
 				if replaced == Config.AacType {
 					if !debug_mode && !more_mode {
-						fmt.Printf("%s\n", variant.Audio)
+						logger.Infof("%s\n", variant.Audio)
 					}
 					streamUrlTemp, err := masterUrl.Parse(variant.URI)
 					if err != nil {
@@ -2406,7 +2710,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				}
 				if length_int <= Config.AlacMax {
 					if !debug_mode && !more_mode {
-						fmt.Printf("%s-bit / %s Hz\n", split[length-1], split[length-2])
+						logger.Infof("%s-bit / %s Hz\n", split[length-1], split[length-2])
 					}
 					streamUrlTemp, err := masterUrl.Parse(variant.URI)
 					if err != nil {
@@ -2477,7 +2781,7 @@ func extractVideo(c string) (string, error) {
 				if err != nil {
 					return "", err
 				}
-				fmt.Println("Video: " + variant.Resolution + "-" + variant.VideoRange)
+				logger.Info("Video: " + variant.Resolution + "-" + variant.VideoRange)
 				break
 			}
 		}
@@ -2494,7 +2798,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 	// Get song info to find album ID
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {
-		fmt.Println("Failed to get song response.")
+		logger.Error("Failed to get song response.")
 		return err
 	}
 
@@ -2505,7 +2809,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 	dl_song = true
 	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId)
 	if err != nil {
-		fmt.Println("Failed to rip song:", err)
+		logger.Error("Failed to rip song:", err)
 		return err
 	}
 
