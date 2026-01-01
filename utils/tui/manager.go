@@ -9,7 +9,7 @@ var p *tea.Program
 func Init() {
 	if p == nil {
 		m := NewModel()
-		p = tea.NewProgram(m, tea.WithAltScreen())
+		p = tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	}
 }
 

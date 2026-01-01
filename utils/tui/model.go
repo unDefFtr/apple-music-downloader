@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -21,6 +22,9 @@ var (
 	totalHeaderHeight = 1
 	totalBarHeight    = 2
 	totalViewHeight   = totalHeaderHeight + totalBarHeight
+
+	tasksHeaderHeight = 2
+	tasksTotalHeight  = 0 // will be calculated dynamically
 
 	logsHeaderHeight = 2
 	logsBorderHeight = 2
@@ -53,13 +57,15 @@ var (
 )
 
 type DownloadTask struct {
-	ID       string
-	Name     string
-	Status   string
-	Progress float64
-	Speed    float64
-	State    string // pending, running, done, error
-	Prog     progress.Model
+	ID        string
+	Name      string
+	Status    string
+	Progress  float64
+	Speed     float64
+	State     string // pending, running, done, error
+	Prog      progress.Model
+	StartTime time.Time
+	EndTime   time.Time
 }
 
 type Model struct {
@@ -83,6 +89,10 @@ type Model struct {
 	selectedIndices map[int]struct{}
 	selectionChan   chan []int
 	selectionOffset int // for scrolling
+
+	// Time tracking
+	StartTime time.Time
+	EndTime   time.Time
 }
 
 type TickMsg time.Time
@@ -100,6 +110,7 @@ func NewModel() Model {
 		totalPercent:    0,
 		totalSpeed:      0,
 		selectedIndices: make(map[int]struct{}),
+		// StartTime will be set when first task starts
 	}
 }
 
@@ -127,6 +138,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.totalProg.Width < 20 {
 			m.totalProg.Width = 20
 		}
+		m.updateTasksViewport()
 
 	case tea.KeyMsg:
 		if m.selectionMode {
@@ -158,6 +170,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.selectionCursor >= m.selectionOffset+m.height-4 { // Reserve some header space
 						m.selectionOffset = m.selectionCursor - (m.height - 4) + 1
 					}
+				}
+			case "pgup":
+				m.selectionCursor -= m.height - 4
+				if m.selectionCursor < 0 {
+					m.selectionCursor = 0
+				}
+				if m.selectionCursor < m.selectionOffset {
+					m.selectionOffset = m.selectionCursor
+				}
+			case "pgdown":
+				m.selectionCursor += m.height - 4
+				if m.selectionCursor >= len(m.selectionItems) {
+					m.selectionCursor = len(m.selectionItems) - 1
+				}
+				if m.selectionCursor >= m.selectionOffset+m.height-4 {
+					m.selectionOffset = m.selectionCursor - (m.height - 4) + 1
 				}
 			case " ":
 				_, ok := m.selectedIndices[m.selectionCursor]
@@ -195,6 +223,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		var cmd tea.Cmd
+		m.tasksViewport, cmd = m.tasksViewport.Update(msg)
+		cmds = append(cmds, cmd)
+
+	case tea.MouseMsg:
+		if m.selectionMode {
+			if msg.Type == tea.MouseWheelUp {
+				if m.selectionCursor > 0 {
+					m.selectionCursor--
+					if m.selectionCursor < m.selectionOffset {
+						m.selectionOffset = m.selectionCursor
+					}
+				}
+			} else if msg.Type == tea.MouseWheelDown {
+				if m.selectionCursor < len(m.selectionItems)-1 {
+					m.selectionCursor++
+					if m.selectionCursor >= m.selectionOffset+m.height-4 {
+						m.selectionOffset = m.selectionCursor - (m.height - 4) + 1
+					}
+				}
+			}
+			return m, nil
+		}
+
+		var cmd tea.Cmd
+		m.tasksViewport, cmd = m.tasksViewport.Update(msg)
+		cmds = append(cmds, cmd)
+
 	case RequestSelectionMsg:
 		m.selectionMode = true
 		m.selectionTitle = msg.Title
@@ -217,17 +273,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		task := &DownloadTask{
-			ID:       msg.ID,
-			Name:     msg.Name,
-			Status:   "Starting...",
-			State:    "pending",
-			Prog:     prog,
-			Progress: 0,
-			Speed:    0,
+			ID:        msg.ID,
+			Name:      msg.Name,
+			Status:    "Starting...",
+			State:     "pending",
+			Prog:      prog,
+			Progress:  0,
+			Speed:     0,
+			StartTime: time.Now(),
 		}
 		m.tasks[msg.ID] = task
 		m.taskKeys = append(m.taskKeys, msg.ID)
 		cmds = append(cmds, task.Prog.SetPercent(0))
+
+		// Start total timer if not started
+		if m.StartTime.IsZero() {
+			m.StartTime = time.Now()
+		}
+		m.updateTasksViewport()
 
 	case UpdateTaskMsg:
 		if task, ok := m.tasks[msg.ID]; ok {
@@ -236,6 +299,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			task.Speed = msg.Speed
 			if msg.State != "" {
 				task.State = msg.State
+				// Stop timer if task is done or error
+				if (msg.State == "done" || msg.State == "error") && task.EndTime.IsZero() {
+					task.EndTime = time.Now()
+				}
 			}
 			cmd := task.Prog.SetPercent(msg.Progress)
 			cmds = append(cmds, cmd)
@@ -248,9 +315,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.totalSpeed = totalSpeed
 		}
+		m.updateTasksViewport()
 
 	case UpdateTotalProgressMsg:
 		m.totalPercent = msg.Progress
+		if msg.Progress >= 1.0 && m.EndTime.IsZero() {
+			m.EndTime = time.Now()
+		}
 		cmd := m.totalProg.SetPercent(msg.Progress)
 		cmds = append(cmds, cmd)
 
@@ -279,6 +350,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		progressModel, cmd := m.totalProg.Update(msg)
 		m.totalProg = progressModel.(progress.Model)
 		cmds = append(cmds, cmd)
+		m.updateTasksViewport()
 	}
 
 	return m, tea.Batch(cmds...)
@@ -303,7 +375,8 @@ func (m *Model) recalculateHeights() {
 	logsActualHeight := logsHeaderHeight + logsBorderHeight + logsViewportHeight
 
 	// 2. Tasks Area
-	tasksTotalHeight := availableHeight - totalViewHeight - logsActualHeight
+	// We need to account for the header which is NOT inside the viewport now
+	tasksTotalHeight := availableHeight - totalViewHeight - logsActualHeight - tasksHeaderHeight - 1 // -1 for extra spacing
 	if tasksTotalHeight < 5 {
 		tasksTotalHeight = 5
 	}
@@ -314,6 +387,59 @@ func (m *Model) recalculateHeights() {
 
 	m.tasksViewport.Width = m.width - 4
 	m.tasksViewport.Height = tasksTotalHeight
+}
+
+func (m *Model) updateTasksViewport() {
+	content := m.renderTaskViews()
+	atBottom := m.tasksViewport.AtBottom()
+	m.tasksViewport.SetContent(content)
+	if atBottom {
+		m.tasksViewport.GotoBottom()
+	}
+}
+
+func (m Model) renderTaskViews() string {
+	var taskViews []string
+	// listHeaderStyle("Downloads") is removed from here
+	for _, id := range m.taskKeys {
+		t := m.tasks[id]
+		icon := " "
+		if t.State == "done" {
+			icon = checkMark.String()
+		} else if t.State == "error" {
+			icon = xMark.String()
+		}
+
+		name := lipgloss.NewStyle().Width(20).Render(truncate(t.Name, 20))
+
+		taskElapsed := time.Duration(0)
+		if !t.StartTime.IsZero() {
+			if !t.EndTime.IsZero() {
+				taskElapsed = t.EndTime.Sub(t.StartTime)
+			} else {
+				taskElapsed = time.Since(t.StartTime)
+			}
+		}
+
+		taskEta := calculateETA(taskElapsed, t.Progress)
+		if t.State == "done" || t.State == "error" || !t.EndTime.IsZero() {
+			taskEta = 0
+		} else if t.State == "pending" {
+			taskElapsed = 0
+			taskEta = 0
+		}
+
+		timeInfo := fmt.Sprintf("%s / %s", formatDuration(taskElapsed), formatDuration(taskEta))
+
+		// Use lipgloss.JoinHorizontal to better control alignment and avoid format string issues
+		view := lipgloss.JoinVertical(lipgloss.Left,
+			fmt.Sprintf("%s %s %s (%s)", icon, name, t.Status, timeInfo),
+			t.Prog.View(),
+		)
+		taskViews = append(taskViews, listItemStyle(view))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, taskViews...)
 }
 
 func (m Model) View() string {
@@ -355,37 +481,60 @@ func (m Model) View() string {
 	}
 
 	// 1. Render Total Progress
-	title := fmt.Sprintf("Total Progress - %s", formatSpeed(m.totalSpeed))
+	elapsed := time.Duration(0)
+	if !m.StartTime.IsZero() {
+		if !m.EndTime.IsZero() {
+			elapsed = m.EndTime.Sub(m.StartTime)
+		} else {
+			elapsed = time.Since(m.StartTime)
+		}
+	}
+
+	eta := calculateETA(elapsed, m.totalPercent)
+	if m.StartTime.IsZero() || m.totalPercent == 0 || !m.EndTime.IsZero() {
+		eta = 0 // Unknown or Done
+	}
+
+	title := fmt.Sprintf("Total Progress - %s - Elapsed: %s - ETA: %s",
+		formatSpeed(m.totalSpeed),
+		formatDuration(elapsed),
+		formatDuration(eta),
+	)
 	totalView := lipgloss.JoinVertical(lipgloss.Left,
 		totalHeaderStyle.Render(title),
 		lipgloss.NewStyle().MarginLeft(2).PaddingTop(1).Render(m.totalProg.View()),
 	)
 
 	// 2. Render Tasks
-	var taskViews []string
-	taskViews = append(taskViews, listHeaderStyle("Downloads"))
-	for _, id := range m.taskKeys {
-		t := m.tasks[id]
-		icon := " "
-		if t.State == "done" {
-			icon = checkMark.String()
-		} else if t.State == "error" {
-			icon = xMark.String()
+	tasksHeader := listHeaderStyle("Downloads")
+	tasksView := m.tasksViewport.View()
+
+	// Add scrollbar for tasks if needed
+	if m.tasksViewport.TotalLineCount() > m.tasksViewport.Height {
+		// Simple ASCII scrollbar
+		scrollPercent := m.tasksViewport.ScrollPercent()
+		if scrollPercent < 0 {
+			scrollPercent = 0
+		}
+		if scrollPercent > 1 {
+			scrollPercent = 1
 		}
 
-		name := lipgloss.NewStyle().Width(20).Render(truncate(t.Name, 20))
-		// Use lipgloss.JoinHorizontal to better control alignment and avoid format string issues
-		view := lipgloss.JoinVertical(lipgloss.Left,
-			fmt.Sprintf("%s %s %s", icon, name, t.Status),
-			t.Prog.View(),
-		)
-		taskViews = append(taskViews, listItemStyle(view))
-	}
+		barHeight := m.tasksViewport.Height
+		thumbHeight := int(math.Max(1, float64(barHeight)*float64(barHeight)/float64(m.tasksViewport.TotalLineCount())))
+		thumbPos := int(scrollPercent * float64(barHeight-thumbHeight))
 
-	tasksContent := lipgloss.JoinVertical(lipgloss.Left, taskViews...)
-	m.tasksViewport.SetContent(tasksContent)
-	m.tasksViewport.GotoBottom()
-	tasksView := m.tasksViewport.View()
+		var bar strings.Builder
+		for i := 0; i < barHeight; i++ {
+			if i >= thumbPos && i < thumbPos+thumbHeight {
+				bar.WriteString("█\n")
+			} else {
+				bar.WriteString("│\n")
+			}
+		}
+
+		tasksView = lipgloss.JoinHorizontal(lipgloss.Top, tasksView, " ", bar.String())
+	}
 
 	// 3. Render Logs
 	logsHeader := listHeaderStyle("Logs")
@@ -396,8 +545,11 @@ func (m Model) View() string {
 
 	// 4. Combine strictly
 	// Use Place to force layout if needed, but JoinVertical is simpler
+	// Add an empty line between totalView and tasksHeader
 	return lipgloss.JoinVertical(lipgloss.Left,
 		totalView,
+		"",
+		tasksHeader,
 		tasksView,
 		logsHeader,
 		logsView,
@@ -419,6 +571,39 @@ func truncate(s string, max int) string {
 		res = append(res, r)
 	}
 	return string(res) + "..."
+}
+
+func calculateETA(elapsed time.Duration, progress float64) time.Duration {
+	if progress <= 0 {
+		return 0
+	}
+	if progress >= 1 {
+		return 0
+	}
+
+	// Estimated Total Time = Elapsed / Progress
+	// ETA = Estimated Total Time - Elapsed
+	// ETA = (Elapsed / Progress) - Elapsed = Elapsed * (1/Progress - 1)
+
+	etaNs := float64(elapsed.Nanoseconds()) * (1/progress - 1)
+	return time.Duration(etaNs)
+}
+
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "--:--"
+	}
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
 func formatSpeed(bps float64) string {
