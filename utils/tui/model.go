@@ -66,6 +66,9 @@ type DownloadTask struct {
 	Prog      progress.Model
 	StartTime time.Time
 	EndTime   time.Time
+
+	// Exit
+	canExit bool
 }
 
 type Model struct {
@@ -93,6 +96,9 @@ type Model struct {
 	// Time tracking
 	StartTime time.Time
 	EndTime   time.Time
+
+	// Exit
+	canExit bool
 }
 
 type TickMsg time.Time
@@ -223,9 +229,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		// Allow scrolling even if canExit is true
 		var cmd tea.Cmd
 		m.tasksViewport, cmd = m.tasksViewport.Update(msg)
 		cmds = append(cmds, cmd)
+
+		if m.canExit {
+			// If key is not a navigation key, exit
+			switch msg.String() {
+			case "up", "down", "pgup", "pgdown", "home", "end":
+				// Navigation keys - do nothing extra, let Viewport handle it
+			default:
+				m.quitting = true
+				return m, tea.Quit
+			}
+		}
 
 	case tea.MouseMsg:
 		if m.selectionMode {
@@ -321,6 +339,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalPercent = msg.Progress
 		if msg.Progress >= 1.0 && m.EndTime.IsZero() {
 			m.EndTime = time.Now()
+			// Enable exit after download finished
+			m.canExit = true
+			m.logs = append(m.logs, "[INFO] All tasks completed. Press any key to exit.")
+			m.viewport.SetContent(strings.Join(m.logs, "\n"))
+			m.viewport.GotoBottom()
 		}
 		cmd := m.totalProg.SetPercent(msg.Progress)
 		cmds = append(cmds, cmd)
@@ -360,25 +383,45 @@ func (m *Model) recalculateHeights() {
 	availableHeight := m.height
 
 	// 1. Logs Area (approx 1/3, max 10 lines to avoid taking too much space)
-	logsTotalHeight := availableHeight / 3
-	if logsTotalHeight > 15 {
-		logsTotalHeight = 15
-	}
-	if logsTotalHeight < 7 {
-		logsTotalHeight = 7
+	// Calculate available height for logs and tasks, subtracting fixed headers
+	// Fixed overhead:
+	// totalView (3) + spacing (1) + tasksHeader (2) + logsHeader (2) + logsBorder (2) = 10
+	overhead := totalViewHeight + 1 + tasksHeaderHeight + logsHeaderHeight + logsBorderHeight
+
+	remaining := availableHeight - overhead
+	if remaining < 0 {
+		remaining = 0
 	}
 
-	logsViewportHeight := logsTotalHeight - logsHeaderHeight - logsBorderHeight
-	if logsViewportHeight < 1 {
-		logsViewportHeight = 1
-	}
-	logsActualHeight := logsHeaderHeight + logsBorderHeight + logsViewportHeight
+	// Default minimums
+	logsViewportHeight := 0
+	tasksTotalHeight := 0
 
-	// 2. Tasks Area
-	// We need to account for the header which is NOT inside the viewport now
-	tasksTotalHeight := availableHeight - totalViewHeight - logsActualHeight - tasksHeaderHeight - 1 // -1 for extra spacing
-	if tasksTotalHeight < 5 {
-		tasksTotalHeight = 5
+	if remaining < 2 {
+		// Very small screen. Give all to tasks.
+		tasksTotalHeight = max(1, remaining)
+		logsViewportHeight = 0
+	} else {
+		// Try to maintain roughly 2:1 ratio for Tasks:Logs viewports
+		// Logs takes 1/3 of remaining
+		logsViewportHeight = remaining / 3
+		if logsViewportHeight < 1 {
+			logsViewportHeight = 1
+		}
+		// Cap logs height if it gets too big
+		if logsViewportHeight > 10 {
+			logsViewportHeight = 10
+		}
+
+		tasksTotalHeight = remaining - logsViewportHeight
+		// Ensure tasks get at least 1 line if possible
+		if tasksTotalHeight < 1 {
+			tasksTotalHeight = 1
+			// Adjust logs if needed
+			if logsViewportHeight > remaining-1 {
+				logsViewportHeight = remaining - 1
+			}
+		}
 	}
 
 	// Apply dimensions
@@ -387,6 +430,13 @@ func (m *Model) recalculateHeights() {
 
 	m.tasksViewport.Width = m.width - 4
 	m.tasksViewport.Height = tasksTotalHeight
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (m *Model) updateTasksViewport() {
@@ -527,9 +577,12 @@ func (m Model) View() string {
 		var bar strings.Builder
 		for i := 0; i < barHeight; i++ {
 			if i >= thumbPos && i < thumbPos+thumbHeight {
-				bar.WriteString("█\n")
+				bar.WriteString("█")
 			} else {
-				bar.WriteString("│\n")
+				bar.WriteString("│")
+			}
+			if i < barHeight-1 {
+				bar.WriteString("\n")
 			}
 		}
 
