@@ -62,6 +62,7 @@ go run main.go --search [album|song|artist] "your search query"
 | `--search [type]` | Search mode (`album`, `song`, `artist`). |
 | `--song` | Download a single song from an album URL. |
 | `--select` | Interactively select songs to download from an album/playlist. |
+| `--ttml` | Disable TTML to LRC conversion and export TTML to metadata. |
 | `--all-album` | Download all albums when an artist URL is provided. |
 | `--atmos` | Download in **Dolby Atmos** format. |
 | `--aac` | Download in **AAC** format. |
