@@ -44,7 +44,6 @@ var (
 	dl_aac         bool
 	dl_select      bool
 	dl_song        bool
-	dl_ttml        bool
 	artist_select  bool
 	debug_mode     bool
 	alac_max       *int
@@ -2064,12 +2063,13 @@ func main() {
 		}
 	}
 	var search_type string
+	var lyrics_type string
 	pflag.StringVar(&search_type, "search", "", "Search for 'album', 'song', or 'artist'. Provide query after flags.")
+	pflag.StringVar(&lyrics_type, "lyrics", "", "Set lyrics format: 'ttml' or 'lrc'")
 	pflag.BoolVar(&dl_atmos, "atmos", false, "Enable atmos download mode")
 	pflag.BoolVar(&dl_aac, "aac", false, "Enable adm-aac download mode")
 	pflag.BoolVar(&dl_select, "select", false, "Enable selective download")
 	pflag.BoolVar(&dl_song, "song", false, "Enable single song download mode")
-	pflag.BoolVar(&dl_ttml, "ttml", false, "Disable TTML to LRC conversion and export TTML to metadata")
 	pflag.BoolVar(&artist_select, "all-album", false, "Download all artist albums")
 	pflag.BoolVar(&debug_mode, "debug", false, "Enable debug mode to show audio quality information")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
@@ -2087,8 +2087,12 @@ func main() {
 	}
 
 	pflag.Parse()
-	if dl_ttml {
-		Config.LrcFormat = "ttml"
+	if lyrics_type != "" {
+		if lyrics_type == "ttml" || lyrics_type == "lrc" {
+			Config.LrcFormat = lyrics_type
+		} else {
+			logger.Warn("Invalid lyrics format. Using default.")
+		}
 	}
 	logger.Init(debug_mode)
 	Config.AlacMax = *alac_max

@@ -64,7 +64,7 @@ go run main.go --search [album|song|artist] "搜索关键词"
 | `--search [type]` | 搜索模式 (`album` 专辑, `song` 歌曲, `artist` 歌手). |
 | `--song` | 从专辑链接中下载单首歌曲. |
 | `--select` | 交互式选择专辑/播放列表中的歌曲进行下载. |
-| `--ttml` | 禁用 TTML 到 LRC 的转换并将 TTML 导出到元数据. |
+| `--lyrics` | 设置歌词格式：`ttml` 或 `lrc`。 |
 | `--all-album` | 当提供歌手链接时，下载该歌手的所有专辑. |
 | `--atmos` | 下载 **Dolby Atmos** (杜比全景声) 格式. |
 | `--aac` | 下载 **AAC** 格式. |
