@@ -33,8 +33,8 @@ Before using this tool, ensure you have the following installed:
     ```bash
     cp config.example.yaml config.yaml
     ```
-    *   **media-user-token**: Required for downloading AAC-LC, MVs, and Lyrics. See "How to get media-user-token" below.
-    *   **decrypt-m3u8-port**: Set to the address of your decryption wrapper (default is usually correct if running locally).
+    *   **auth.media-user-token**: Required for downloading AAC-LC, MVs, and Lyrics. See "How to get media-user-token" below.
+    *   **download.m3u8.decrypt-port**: Set to the address of your decryption wrapper (default is usually correct if running locally).
 
 ## 📖 Usage
 
@@ -43,57 +43,66 @@ Before using this tool, ensure you have the following installed:
 Run the downloader with a URL:
 
 ```bash
-go run main.go [URL]
+go run main.go download [URL]
 ```
 
-### Search Mode (Interactive)
+### Search Mode
 
-Search for media interactively:
+Search for media:
 
 ```bash
-go run main.go --search [album|song|artist] "your search query"
+go run main.go search [album|song|artist|playlist] "your search query"
 ```
-*Example*: `go run main.go --search artist "Taylor Swift"`
+*Example*: `go run main.go search artist "Taylor Swift"`
 
-### Command Line Flags
+### Download Flags
 
 | Flag | Description |
 | :--- | :--- |
-| `--search [type]` | Search mode (`album`, `song`, `artist`). |
-| `--song` | Download a single song from an album URL. |
-| `--select` | Interactively select songs to download from an album/playlist. |
-| `--lyrics` | Set lyrics format: `ttml` or `lrc`. |
-| `--all-album` | Download all albums when an artist URL is provided. |
-| `--atmos` | Download in **Dolby Atmos** format. |
-| `--aac` | Download in **AAC** format. |
-| `--debug` | Enable debug mode (shows quality info). |
-| `--thread [num]` | Set number of download threads (default: 1). |
+| `--codec <aac|alac|atmos>` | Select audio codec. |
+| `--max-quality <value>` | Max quality (e.g. `192k`, `2768`). |
+| `--lyrics` | Enable lyrics download. |
+| `--lyrics-format <ttml|lrc>` | Lyrics format. |
+| `--lyrics-type <plain|syllable>` | Lyrics type. |
+| `--embed-lyrics` | Embed lyrics into audio. |
+| `--save-lyrics` | Save lyrics to file. |
+| `--no-cover` | Disable cover embed/save. |
+| `--cover-file` | Write cover image file. |
+| `--cover-name <name>` | Cover file base name. |
+| `--cover-size <size>` | Cover size (e.g. `5000`). |
+| `--cover-format <jpg|png|original>` | Cover format. |
+| `--output <path>` | Output directory. |
+| `--threads <num>` | Download threads. |
+| `--select` | Interactively select tracks. |
+| `--preset <default|lossless|archival|minimal>` | Preset modes. |
+| `--convert <flac|mp3|opus|wav>` | Convert after download. |
+| `--keep-original` | Keep original files after conversion. |
 
 ### Examples
 
 **Download an Album:**
 ```bash
-go run main.go https://music.apple.com/us/album/1989-taylors-version/1708308989
+go run main.go download https://music.apple.com/us/album/1989-taylors-version/1708308989
 ```
 
 **Download a Single Song:**
 ```bash
-go run main.go --song https://music.apple.com/us/album/cruel-summer/1468027721?i=1468027728
+go run main.go download song https://music.apple.com/us/song/cruel-summer/1468027728
 ```
 
 **Select Specific Tracks:**
 ```bash
-go run main.go --select https://music.apple.com/us/album/midnights/1649438810
+go run main.go download https://music.apple.com/us/album/midnights/1649438810 --select
 ```
 
 **Download Dolby Atmos:**
 ```bash
-go run main.go --atmos https://music.apple.com/us/album/1989-taylors-version/1708308989
+go run main.go download https://music.apple.com/us/album/1989-taylors-version/1708308989 --codec atmos
 ```
 
 **Download Music Video:**
 ```bash
-go run main.go https://music.apple.com/us/music-video/anti-hero/1649439395
+go run main.go download https://music.apple.com/us/music-video/anti-hero/1649439395
 ```
 
 ## 🐳 Docker Usage
@@ -106,7 +115,7 @@ go run main.go https://music.apple.com/us/music-video/anti-hero/1649439395
 2.  **Run**:
     Ensure your config is set up and the wrapper is accessible.
     ```bash
-    docker run --network host -v $(pwd)/downloads:/downloads apple-music-dl [URL/Flags]
+    docker run --network host -v $(pwd)/downloads:/downloads apple-music-dl download [URL/Flags]
     ```
 
 ## 🔑 How to get `media-user-token`
@@ -114,7 +123,7 @@ go run main.go https://music.apple.com/us/music-video/anti-hero/1649439395
 1.  Open [Apple Music](https://music.apple.com) in your browser and log in.
 2.  Open Developer Tools (F12) -> Application (or Storage) -> Cookies.
 3.  Look for `https://music.apple.com` and find the cookie named `media-user-token`.
-4.  Copy the value and paste it into your `config.yaml`.
+4.  Copy the value and paste it into `auth.media-user-token` in your `config.yaml`.
 
 ## 📝 Notes
 

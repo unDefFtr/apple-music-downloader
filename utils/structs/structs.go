@@ -1,52 +1,97 @@
 package structs
 
 type ConfigSet struct {
-	Storefront                 string `yaml:"storefront"`
-	MediaUserToken             string `yaml:"media-user-token"`
-	AuthorizationToken         string `yaml:"authorization-token"`
-	Language                   string `yaml:"language"`
-	SaveLrcFile                bool   `yaml:"save-lrc-file"`
-	LrcType                    string `yaml:"lrc-type"`
-	LrcFormat                  string `yaml:"lrc-format"`
-	SaveAnimatedArtwork        bool   `yaml:"save-animated-artwork"`
-	EmbyAnimatedArtwork        bool   `yaml:"emby-animated-artwork"`
-	EmbedLrc                   bool   `yaml:"embed-lrc"`
-	EmbedCover                 bool   `yaml:"embed-cover"`
-	SaveArtistCover            bool   `yaml:"save-artist-cover"`
-	CoverSize                  string `yaml:"cover-size"`
-	CoverFormat                string `yaml:"cover-format"`
-	AlacSaveFolder             string `yaml:"alac-save-folder"`
-	AtmosSaveFolder            string `yaml:"atmos-save-folder"`
-	AacSaveFolder              string `yaml:"aac-save-folder"`
-	AlbumFolderFormat          string `yaml:"album-folder-format"`
-	PlaylistFolderFormat       string `yaml:"playlist-folder-format"`
-	ArtistFolderFormat         string `yaml:"artist-folder-format"`
-	SongFileFormat             string `yaml:"song-file-format"`
-	ExplicitChoice             string `yaml:"explicit-choice"`
-	CleanChoice                string `yaml:"clean-choice"`
-	AppleMasterChoice          string `yaml:"apple-master-choice"`
-	MaxMemoryLimit             int    `yaml:"max-memory-limit"`
-	DecryptM3u8Port            string `yaml:"decrypt-m3u8-port"`
-	GetM3u8Port                string `yaml:"get-m3u8-port"`
-	GetM3u8Mode                string `yaml:"get-m3u8-mode"`
-	GetM3u8FromDevice          bool   `yaml:"get-m3u8-from-device"`
-	AacType                    string `yaml:"aac-type"`
-	AlacMax                    int    `yaml:"alac-max"`
-	AtmosMax                   int    `yaml:"atmos-max"`
-	LimitMax                   int    `yaml:"limit-max"`
-	UseSongInfoForPlaylist     bool   `yaml:"use-songinfo-for-playlist"`
-	DlAlbumcoverForPlaylist    bool   `yaml:"dl-albumcover-for-playlist"`
-	MVAudioType                string `yaml:"mv-audio-type"`
-	MVMax                      int    `yaml:"mv-max"`
-	ConvertAfterDownload       bool   `yaml:"convert-after-download"`
-	ConvertFormat              string `yaml:"convert-format"`
-	ConvertKeepOriginal        bool   `yaml:"convert-keep-original"`
-	ConvertSkipIfSourceMatch   bool   `yaml:"convert-skip-if-source-matches"`
-	FFmpegPath                 string `yaml:"ffmpeg-path"`
-	ConvertExtraArgs           string `yaml:"convert-extra-args"`
-	ConvertWarnLossyToLossless bool   `yaml:"convert-warn-lossy-to-lossless"`
-	ConvertSkipLossyToLossless bool   `yaml:"convert-skip-lossy-to-lossless"`
-	ThreadNum                  int    `yaml:"thread-num"`
+	Auth     AuthConfig     `yaml:"auth"`
+	Download DownloadConfig `yaml:"download"`
+	Lyrics   LyricsConfig   `yaml:"lyrics"`
+	Artwork  ArtworkConfig  `yaml:"artwork"`
+	Paths    PathsConfig    `yaml:"paths"`
+	Naming   NamingConfig   `yaml:"naming"`
+	Convert  ConvertConfig  `yaml:"convert"`
+}
+
+type AuthConfig struct {
+	MediaUserToken     string `yaml:"media-user-token"`
+	AuthorizationToken string `yaml:"authorization-token"`
+	Storefront         string `yaml:"storefront"`
+	Language           string `yaml:"language"`
+}
+
+type DownloadConfig struct {
+	Codec     DownloadCodecConfig    `yaml:"codec"`
+	Threads   int                    `yaml:"threads"`
+	MaxMemory int                    `yaml:"max-memory"`
+	M3U8      DownloadM3U8Config     `yaml:"m3u8"`
+	Playlist  DownloadPlaylistConfig `yaml:"playlist"`
+	MV        DownloadMVConfig       `yaml:"mv"`
+}
+
+type DownloadCodecConfig struct {
+	AacType  string `yaml:"aac-type"`
+	AlacMax  int    `yaml:"alac-max"`
+	AtmosMax int    `yaml:"atmos-max"`
+}
+
+type DownloadM3U8Config struct {
+	DecryptPort   string `yaml:"decrypt-port"`
+	GetPort       string `yaml:"get-port"`
+	GetFromDevice bool   `yaml:"get-from-device"`
+	Mode          string `yaml:"mode"`
+}
+
+type DownloadPlaylistConfig struct {
+	UseSongInfo        bool `yaml:"use-songinfo-for-playlist"`
+	DownloadAlbumCover bool `yaml:"dl-albumcover-for-playlist"`
+}
+
+type DownloadMVConfig struct {
+	AudioType string `yaml:"audio-type"`
+	Max       int    `yaml:"max"`
+}
+
+type LyricsConfig struct {
+	Enable   bool   `yaml:"enable"`
+	Type     string `yaml:"type"`
+	Format   string `yaml:"format"`
+	Embed    bool   `yaml:"embed"`
+	SaveFile bool   `yaml:"save-file"`
+}
+
+type ArtworkConfig struct {
+	EmbedCover      bool   `yaml:"embed-cover"`
+	Size            string `yaml:"size"`
+	Format          string `yaml:"format"`
+	SaveArtistCover bool   `yaml:"save-artist-cover"`
+	SaveAnimated    bool   `yaml:"save-animated"`
+	EmbyAnimated    bool   `yaml:"emby-animated"`
+}
+
+type PathsConfig struct {
+	Alac  string `yaml:"alac"`
+	Atmos string `yaml:"atmos"`
+	Aac   string `yaml:"aac"`
+}
+
+type NamingConfig struct {
+	Album             string `yaml:"album"`
+	Playlist          string `yaml:"playlist"`
+	Song              string `yaml:"song"`
+	Artist            string `yaml:"artist"`
+	ExplicitChoice    string `yaml:"explicit-choice"`
+	CleanChoice       string `yaml:"clean-choice"`
+	AppleMasterChoice string `yaml:"apple-master-choice"`
+	LimitMax          int    `yaml:"limit-max"`
+}
+
+type ConvertConfig struct {
+	Enable              bool   `yaml:"enable"`
+	Format              string `yaml:"format"`
+	KeepOriginal        bool   `yaml:"keep-original"`
+	SkipIfSourceMatches bool   `yaml:"skip-if-source-matches"`
+	FFmpegPath          string `yaml:"ffmpeg"`
+	ExtraArgs           string `yaml:"extra-args"`
+	WarnLossyToLossless bool   `yaml:"warn-lossy-to-lossless"`
+	SkipLossyToLossless bool   `yaml:"skip-lossy-to-lossless"`
 }
 
 type ProgressCallback func(percent float64, msg string, speed float64)

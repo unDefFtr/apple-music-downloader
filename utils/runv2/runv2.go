@@ -304,7 +304,7 @@ func Decrypt(dCtx *DecryptionContext, tempFile string, outFile string, cb struct
 	defer f.Close()
 
 	// connect to decryptor
-	addr := dCtx.Config.DecryptM3u8Port
+	addr := dCtx.Config.Download.M3U8.DecryptPort
 	if cb != nil {
 		cb(0.0, "Connecting to Decryptor", 0)
 	}
@@ -327,7 +327,7 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	}
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
-	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
+	MaxMemorySize := int64(Config.Download.MaxMemory * 1024 * 1024)
 	inBuf := bufio.NewReader(in)
 	if totalLen <= MaxMemorySize {
 		outBuf = bufio.NewWriter(&buffer)
