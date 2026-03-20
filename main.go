@@ -61,6 +61,9 @@ var (
 	coverFile      bool
 	coverName      string
 	coverDisabled  bool
+	stdoutOutput   bool
+	stdoutTempDir  string
+	stdoutMu       sync.Mutex
 )
 
 func LimitString(s string) string {
@@ -87,6 +90,70 @@ func fileExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func enableStdoutOutput() error {
+	if stdoutOutput {
+		return nil
+	}
+	tempDir, err := os.MkdirTemp("", "amdl-stdout-")
+	if err != nil {
+		return err
+	}
+	stdoutOutput = true
+	stdoutTempDir = tempDir
+	Config.Paths.Alac = tempDir
+	Config.Paths.Atmos = tempDir
+	Config.Paths.Aac = tempDir
+	return nil
+}
+
+func cleanupStdoutOutput() {
+	if stdoutTempDir == "" {
+		stdoutOutput = false
+		return
+	}
+	if err := os.RemoveAll(stdoutTempDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to clean temp dir: %v\n", err)
+	}
+	stdoutTempDir = ""
+	stdoutOutput = false
+}
+
+func stdoutLogHook(level, msg string) {
+	if msg == "" {
+		return
+	}
+	msg = strings.TrimSuffix(msg, "\n")
+	fmt.Fprintf(os.Stderr, "[%s] %s\n", level, msg)
+}
+
+func outputPathToStdout(path string) error {
+	if !stdoutOutput {
+		return nil
+	}
+	if path == "" {
+		return errors.New("stdout mode: empty output path")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	_, err = io.Copy(os.Stdout, f)
+	return err
+}
+
+func outputTrackToStdout(track *task.Track) error {
+	if !stdoutOutput {
+		return nil
+	}
+	if track == nil || track.SavePath == "" {
+		return errors.New("stdout mode: no output file generated")
+	}
+	return outputPathToStdout(track.SavePath)
 }
 
 func checkUrl(url string) (string, string) {
@@ -819,6 +886,12 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, downloadSe
 		// Check if it was actually skipped or done
 		// If tempFile is empty, it might mean it exists or v3 handled it
 		// We should increment success here if err was nil
+		if err := outputTrackToStdout(track); err != nil && stdoutOutput {
+			logger.Errorf("Stdout output failed: %v", err)
+			tui.UpdateTask(track.ID, 0, "Stdout Failed", "error", 0)
+			incrementError()
+			return
+		}
 		incrementSuccess()
 		addToOkDict(track.PreID, track.TaskNum)
 		tui.UpdateTask(track.ID, 1.0, "Done", "done", 0)
@@ -859,6 +932,13 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, downloadSe
 		return
 	}
 
+	if err := outputTrackToStdout(track); err != nil && stdoutOutput {
+		logger.Errorf("Stdout output failed: %v", err)
+		tui.UpdateTask(track.ID, 0, "Stdout Failed", "error", 0)
+		incrementError()
+		return
+	}
+
 	incrementSuccess()
 	addToOkDict(track.PreID, track.TaskNum)
 	tui.UpdateTask(track.ID, 1.0, "Done", "done", 0)
@@ -882,10 +962,14 @@ func doRipTrackDownload(track *task.Track, token string, mediaUserToken string, 
 			logger.Warn("mp4decrypt is not found, skipping MV dl")
 			return nil, "", nil
 		}
-		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track, cb)
+		outPath, err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track, cb)
 		if err != nil {
 			logger.Errorf("Failed to dl MV: %v", err)
 			return nil, "", err
+		}
+		if outPath != "" {
+			track.SavePath = outPath
+			track.SaveName = filepath.Base(outPath)
 		}
 		return nil, "", nil
 	}
@@ -966,6 +1050,7 @@ func doRipTrackDownload(track *task.Track, token string, mediaUserToken string, 
 	filename := fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
 	track.SaveName = filename
 	trackPath := filepath.Join(track.SaveDir, track.SaveName)
+	track.SavePath = trackPath
 
 	// Determine possible post-conversion target file (so we can skip re-download)
 	var convertedPath string
@@ -1011,6 +1096,8 @@ func doRipTrackDownload(track *task.Track, token string, mediaUserToken string, 
 		existsConverted, err2 := fileExists(convertedPath)
 		if err2 == nil && existsConverted {
 			logger.Info("Converted track already exists locally.")
+			track.SavePath = convertedPath
+			track.SaveName = filepath.Base(convertedPath)
 			return nil, "", nil
 		}
 	}
@@ -2127,12 +2214,19 @@ func runDownloads(args []string, token string) {
 				cb := func(p float64, msg string, speed float64) {
 					tui.UpdateTask(albumId, p, msg, "downloading", speed)
 				}
-				err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.Auth.MediaUserToken, nil, cb)
+				mvOutPath, err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.Auth.MediaUserToken, nil, cb)
 				tui.UpdateTask(albumId, 1.0, "Done", "done", 0)
 				if err != nil {
 					logger.Errorf("\u26A0 Failed to dl MV: %v", err)
 					counter.Error++
 					continue
+				}
+				if stdoutOutput {
+					if err := outputPathToStdout(mvOutPath); err != nil {
+						logger.Errorf("Stdout output failed: %v", err)
+						counter.Error++
+						continue
+					}
 				}
 				counter.Success++
 				continue
@@ -2189,6 +2283,9 @@ func runDownloads(args []string, token string) {
 		if counter.Error == 0 {
 			break
 		}
+		if stdoutOutput {
+			break
+		}
 		logger.Info("Error detected, press Enter to try again...")
 		fmt.Scanln()
 		logger.Info("Start trying again...")
@@ -2196,11 +2293,11 @@ func runDownloads(args []string, token string) {
 	}
 }
 
-func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track, cb structs.ProgressCallback) error {
+func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track, cb structs.ProgressCallback) (string, error) {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Auth.Language, token)
 	if err != nil {
 		logger.Errorf("Failed to get MV manifest: %v", err)
-		return nil
+		return "", nil
 	}
 
 	if strings.HasSuffix(saveDir, ".") {
@@ -2222,12 +2319,12 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	exists, _ := fileExists(mvOutPath)
 	if exists {
 		logger.Info("MV already exists locally.")
-		return nil
+		return mvOutPath, nil
 	}
 
 	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, mediaUserToken, true)
 	if mvm3u8url == "" {
-		return errors.New("media-user-token may wrong or expired")
+		return "", errors.New("media-user-token may wrong or expired")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
@@ -2323,10 +2420,10 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	logger.Infof("MV Remuxing...")
 	if err := muxCmd.Run(); err != nil {
 		logger.Errorf("MV mux failed: %v\n", err)
-		return err
+		return "", err
 	}
 	logger.Info("MV Remuxed.")
-	return nil
+	return mvOutPath, nil
 }
 
 func extractMvAudio(c string) (string, error) {
@@ -3208,8 +3305,25 @@ func handleDownload(args []string) {
 	}
 
 	rest := fs.Args()
+	stdoutRequested := false
+	filtered := rest[:0]
+	for _, arg := range rest {
+		if arg == "-" {
+			stdoutRequested = true
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	rest = filtered
+	if stdoutRequested {
+		if err := enableStdoutOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to enable stdout mode: %v\n", err)
+			return
+		}
+	}
 	if len(rest) == 0 {
 		fmt.Println("Usage: amdl download <url> [flags]")
+		cleanupStdoutOutput()
 		return
 	}
 
@@ -3220,7 +3334,7 @@ func handleDownload(args []string) {
 	}
 
 	applyPreset(preset)
-	applyDownloadFlags(fs, downloadFlagOptions{
+	if err := applyDownloadFlags(fs, downloadFlagOptions{
 		codec:        codec,
 		maxQuality:   maxQuality,
 		lyrics:       lyrics,
@@ -3238,9 +3352,19 @@ func handleDownload(args []string) {
 		selectFlag:   selectFlag,
 		convert:      convert,
 		keepOriginal: keepOriginal,
-	})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to apply flags: %v\n", err)
+		cleanupStdoutOutput()
+		return
+	}
+	if stdoutOutput {
+		defer cleanupStdoutOutput()
+	}
 
 	logger.Init(false)
+	if stdoutOutput {
+		logger.LogHook = stdoutLogHook
+	}
 	decryptSem = make(chan struct{}, 1)
 
 	urls, err := resolveDownloadTargets(dlType, rest, token)
@@ -3275,6 +3399,11 @@ func handleDownload(args []string) {
 		urls = append(albumArgs, mvArgs...)
 	}
 
+	if stdoutOutput {
+		runDownloads(urls, token)
+		return
+	}
+
 	logger.LogHook = tui.SendLog
 	tui.Init()
 	go func() {
@@ -3305,7 +3434,7 @@ type downloadFlagOptions struct {
 	keepOriginal bool
 }
 
-func applyDownloadFlags(fs *pflag.FlagSet, opts downloadFlagOptions) {
+func applyDownloadFlags(fs *pflag.FlagSet, opts downloadFlagOptions) error {
 	if fs.Lookup("codec").Changed {
 		switch strings.ToLower(opts.codec) {
 		case "aac":
@@ -3400,10 +3529,18 @@ func applyDownloadFlags(fs *pflag.FlagSet, opts downloadFlagOptions) {
 		}
 	}
 	if fs.Lookup("output").Changed && opts.output != "" {
-		out := expandPath(opts.output)
-		Config.Paths.Alac = out
-		Config.Paths.Atmos = out
-		Config.Paths.Aac = out
+		if stdoutOutput && opts.output != "-" {
+			fmt.Fprintln(os.Stderr, "stdout mode ignores --output; using temp dir")
+		} else if opts.output == "-" {
+			if err := enableStdoutOutput(); err != nil {
+				return err
+			}
+		} else {
+			out := expandPath(opts.output)
+			Config.Paths.Alac = out
+			Config.Paths.Atmos = out
+			Config.Paths.Aac = out
+		}
 	}
 	if fs.Lookup("threads").Changed && opts.threads > 0 {
 		Config.Download.Threads = opts.threads
@@ -3423,6 +3560,16 @@ func applyDownloadFlags(fs *pflag.FlagSet, opts downloadFlagOptions) {
 	if fs.Lookup("keep-original").Changed && opts.keepOriginal {
 		Config.Convert.KeepOriginal = true
 	}
+	if stdoutOutput {
+		if dl_select {
+			return errors.New("stdout mode does not support --select")
+		}
+		if fs.Lookup("threads").Changed && opts.threads > 1 {
+			fmt.Fprintln(os.Stderr, "stdout mode forces --threads=1")
+		}
+		Config.Download.Threads = 1
+	}
+	return nil
 }
 
 func applyPreset(preset string) {
@@ -4076,12 +4223,15 @@ func resetRuntimeFlags() {
 	coverFile = false
 	coverName = ""
 	coverDisabled = false
+	stdoutOutput = false
+	stdoutTempDir = ""
 }
 
 func printDownloadHelp() {
 	fmt.Println("Usage:")
 	fmt.Println("  amdl download <url> [flags]")
 	fmt.Println("  amdl download <song|album|playlist|artist> <url> [flags]")
+	fmt.Println("  (use '-' as a positional arg to write output to stdout)")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  --codec <aac|alac|atmos>        audio codec")
@@ -4108,6 +4258,7 @@ func printDownloadHelp() {
 	fmt.Println("  amdl download song https://music.apple.com/.../song/...")
 	fmt.Println("  amdl download <url> --codec alac --lyrics --embed-lyrics")
 	fmt.Println("  amdl download <url> --preset archival")
+	fmt.Println("  amdl download song <url> - > output.m4a")
 }
 
 func printSearchHelp() {
